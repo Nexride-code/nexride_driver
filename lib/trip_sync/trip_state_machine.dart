@@ -118,10 +118,14 @@ class TripStateMachine {
       'driver_assigned' ||
       'matched' ||
       'pending_driver_acceptance' ||
-      'pending_driver_action' =>
+      'pending_driver_action' ||
+      'driver_reviewing_request' =>
         TripLifecycleState.pendingDriverAction,
       'accepted' || 'driver_accepted' => TripLifecycleState.driverAccepted,
-      'arriving' || 'driver_arriving' => TripLifecycleState.driverArriving,
+      'arriving' ||
+      'driver_arriving' ||
+      'driver_on_the_way' =>
+        TripLifecycleState.driverArriving,
       'arrived' || 'driver_arrived' => TripLifecycleState.driverArrived,
       'on_trip' ||
       'ontrip' ||
@@ -148,8 +152,12 @@ class TripStateMachine {
     final normalizedStatus = _normalizeText(status);
 
     String? canonicalFromTripStateField() {
-      if (normalizedTripState == 'pending_driver_acceptance') {
+      if (normalizedTripState == 'pending_driver_acceptance' ||
+          normalizedTripState == 'driver_reviewing_request') {
         return TripLifecycleState.pendingDriverAction;
+      }
+      if (normalizedTripState == 'driver_on_the_way') {
+        return TripLifecycleState.driverArriving;
       }
       if (TripLifecycleState.all.contains(normalizedTripState)) {
         // Partial writes can leave [trip_state] at [requested] while [status] is
