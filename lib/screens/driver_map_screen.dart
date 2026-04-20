@@ -71,6 +71,9 @@ const Duration _kRouteRefreshInterval = Duration(seconds: 12);
 const Duration _kActiveRouteDebounceDuration = Duration(milliseconds: 400);
 const Duration _kPopupRouteDebounceDuration = Duration(milliseconds: 150);
 const int _kRidePopupCountdownSeconds = 30;
+// Temporary debug switch: keep market matching strict, but bypass distance
+// radius suppression so all active rides in the same market are visible.
+const bool _kDebugAllowAllActiveMarketRides = true;
 const String _kPendingDriverAcceptanceStatus = 'pending_driver_acceptance';
 const double _kRouteRefreshDistanceMeters = 35;
 const double _kArrivedDistanceThresholdMeters = 100;
@@ -5812,6 +5815,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (uiStatus == 'cancelled') {
       _logPopupFix('skip reason=ride_cancelled rideId=$rideId');
       _logPopupServerSkip(rideId, rideData, 'ride_cancelled');
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_FILTER] rideId=$rideId status=cancelled qualifies=false reason=ride_cancelled',
+      );
       return 'ride_cancelled';
     }
 
@@ -5837,16 +5843,15 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (expiresAt > 0 && nowTimestamp >= expiresAt) {
       _logPopupFix('skip reason=expired rideId=$rideId');
       _logPopupServerSkip(rideId, rideData, 'expired');
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_FILTER] rideId=$rideId status=$uiStatus qualifies=false reason=expired',
+      );
       return 'expired';
     }
 
-    // Align with active pre-accept [trip_state] phases (requested / searching_driver /
-    // pending_driver_action), not only legacy "searching" / "requested" UI labels.
-    final inPreAcceptUiPhase = uiStatus == 'searching' ||
-        uiStatus == 'requested' ||
-        uiStatus == 'pending_driver_action';
-    if (!inPreAcceptUiPhase) {
-      _logPopupFix('skip reason=status_not_searching rideId=$rideId');
+    // Discovery source-of-truth: rider-created open rides are "searching".
+    if (uiStatus != 'searching') {
+      _logPopupFix('skip reason=status_not_active_open rideId=$rideId');
       _logPopupServerSkip(rideId, rideData, 'status_not_searching');
       return 'status_not_searching';
     }
@@ -6028,8 +6033,14 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
       if (pickupDistanceMeters >
           DriverDispatchConfig.nearbyRequestRadiusMeters) {
-        _logPopupServerSkip(rideId, rideData, 'outside_dispatch_radius');
-        return 'outside_dispatch_radius';
+        if (_kDebugAllowAllActiveMarketRides) {
+          _logRideReq(
+            'radius filter bypassed for debug rideId=$rideId distanceMeters=${pickupDistanceMeters.round()} max=${DriverDispatchConfig.nearbyRequestRadiusMeters}',
+          );
+        } else {
+          _logPopupServerSkip(rideId, rideData, 'outside_dispatch_radius');
+          return 'outside_dispatch_radius';
+        }
       }
     }
 
@@ -6586,6 +6597,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logRtdb(
         'assignment blocked rideId=${ride.rideId} reason=$latestBlockedReason',
       );
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_DECISION] decision=rejected rideId=${ride.rideId} '
+        'status=${latestRideData == null ? 'unknown' : TripStateMachine.uiStatusFromSnapshot(latestRideData)} '
+        'reason=$latestBlockedReason stage=reserve_popup',
+      );
       return null;
     }
 
@@ -6641,6 +6657,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         rideId: ride.rideId, rideData: reservedRideData);
     _logRtdb(
       'assignment reserved rideId=${ride.rideId} path=$requestPath driverId=$driverId',
+    );
+    _logRideReq(
+      '[MATCH_DEBUG][DRIVER_DECISION] decision=accepted_for_popup rideId=${ride.rideId} '
+      'status=${TripStateMachine.uiStatusFromSnapshot(reservedRideData)} stage=reserve_popup',
     );
     unawaited(
       _driverTripSafetyService
@@ -8763,6 +8783,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     driverCity = DriverServiceAreaConfig.marketForCity(driverCity).city;
     _logReqDebug('listener attach START market=$driverCity');
+    _logRideReq(
+      'driver online state for discovery online=$_isOnline session=$_onlineSessionStartedAt market=$driverCity',
+    );
     _logDiscoveryChain(
       'listener_query_market canonical=$driverCity raw_effective=${_effectiveDriverMarket ?? 'null'}',
     );
@@ -8808,6 +8831,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       'queryPath=ride_requests orderByChild=market equalTo=$driverCity',
     );
 
+    Future<void> snapshotProcessingChain = Future<void>.value();
+
     Future<void> processSnapshot(
       rtdb.DataSnapshot snapshot, {
       required String source,
@@ -8850,6 +8875,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               skipReason.isEmpty;
           _logRideReq(
             'ride discovery evaluation rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason} source=$source',
+          );
+          _logRideReq(
+            '[MATCH_DEBUG][DRIVER_LISTENER] rideId=$rideId source=$source '
+            'status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason}',
           );
           _logReqDebug(
             'ride eval rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason}',
@@ -9192,6 +9221,23 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         }
     }
 
+    Future<void> queueSnapshotProcessing(
+      rtdb.DataSnapshot snapshot, {
+      required String source,
+      required int listenerToken,
+    }) async {
+      snapshotProcessingChain = snapshotProcessingChain
+          .catchError((Object _) {})
+          .then(
+            (_) => processSnapshot(
+              snapshot,
+              source: source,
+              listenerToken: listenerToken,
+            ),
+          );
+      await snapshotProcessingChain;
+    }
+
     if (_rideRequestSubscription != null &&
         _rideRequestsListenerBoundCity == driverCity) {
       final listenerToken = _rideRequestListenerToken;
@@ -9213,7 +9259,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             market: driverCity,
             run: () => rideRequestsQuery.get(),
           );
-          await processSnapshot(
+          await queueSnapshotProcessing(
             snapshot,
             source: 'listener_refresh_$reason',
             listenerToken: listenerToken,
@@ -9248,7 +9294,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _rideRequestSubscription = rideRequestsQuery.onValue.listen(
         (event) async {
           try {
-            await processSnapshot(
+            await queueSnapshotProcessing(
               event.snapshot,
               source: 'stream',
               listenerToken: listenerToken,
@@ -9296,7 +9342,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           market: driverCity,
           run: () => rideRequestsQuery.get(),
         );
-        await processSnapshot(
+        await queueSnapshotProcessing(
           primeSnapshot,
           source: 'prime_get',
           listenerToken: listenerToken,
@@ -9379,6 +9425,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (statusChanged) {
       _log(
         'active ride status transition rideId=$rideId from=$previousStatus to=$status',
+      );
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_RIDE_STATUS] rideId=$rideId from=$previousStatus to=$status',
       );
     }
 
@@ -10377,6 +10426,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             ? blockedReason
             : _acceptBlockedReasonFromRideData(rideId, latestRideData);
         _logRtdb('accept blocked rideId=$rideId reason=$latestBlockedReason');
+        _logRideReq(
+          '[MATCH_DEBUG][DRIVER_DECISION] decision=rejected rideId=$rideId '
+          'status=${latestRideData == null ? 'unknown' : TripStateMachine.uiStatusFromSnapshot(latestRideData)} '
+          'reason=$latestBlockedReason stage=accept',
+        );
         if (_rideBelongsToAnotherDriver(latestRideData)) {
           _logRtdb('accept lost rideId=$rideId');
         }
@@ -10426,6 +10480,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         }
       }
       final validatedCommittedRideData = committedRideData;
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_DECISION] decision=accepted rideId=$rideId '
+        'status=${TripStateMachine.uiStatusFromSnapshot(validatedCommittedRideData)} stage=accept',
+      );
       final committedCanonicalForCommit =
           TripStateMachine.canonicalStateFromSnapshot(
         validatedCommittedRideData,
