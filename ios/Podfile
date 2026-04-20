@@ -91,6 +91,27 @@ post_install do |installer|
     File.write(grpc_basic_seq_path, patched)
   end
 
+  # agora_rtc_engine: `typeof(self)` breaks Objective-C++ parsing (weakSelf / unqualified-id).
+  # Use Clang's portable __typeof__ extension (see AgoraSurfaceViewFactory.mm).
+  agora_surface_glob = File.expand_path(
+    File.join('.symlinks', 'plugins', 'agora_rtc_engine', '**', 'AgoraSurfaceViewFactory.mm'),
+    __dir__,
+  )
+  Dir.glob(agora_surface_glob).each do |surface_path|
+    next unless File.file?(surface_path)
+
+    contents = File.read(surface_path)
+    patched = contents.gsub(
+      '__weak typeof(self) weakSelf = self;',
+      '__weak __typeof__(self) weakSelf = self;',
+    )
+    next if patched == contents
+
+    File.chmod(0o644, surface_path)
+    File.write(surface_path, patched)
+    puts "Patched AgoraSurfaceViewFactory.mm for ObjC++ (__typeof__): #{surface_path}"
+  end
+
   installer.aggregate_targets.map(&:user_project).uniq.each do |project|
     project.targets.each do |target|
       target.build_configurations.each do |config|

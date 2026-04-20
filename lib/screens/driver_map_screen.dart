@@ -278,6 +278,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   StreamSubscription<rtdb.DatabaseEvent>? _rideRequestSubscription;
   /// City key for the active [ride_requests] market query (null if no listener).
   String? _rideRequestsListenerBoundCity;
+  int _rideRequestListenerToken = 0;
   StreamSubscription<rtdb.DatabaseEvent>? _driverActiveRideSubscription;
   StreamSubscription<rtdb.DatabaseEvent>? _activeRideSubscription;
   final List<StreamSubscription<rtdb.DatabaseEvent>> _driverChatSubscriptions =
@@ -700,9 +701,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     );
     await _positionStream?.cancel();
     _positionStream = null;
-    await _rideRequestSubscription?.cancel();
-    _rideRequestSubscription = null;
-    _rideRequestsListenerBoundCity = null;
+    await _cancelRideRequestListener(reason: 'startup_restore_reset');
     await _driverActiveRideSubscription?.cancel();
     _driverActiveRideSubscription = null;
     await _stopIncomingCallMonitoring();
@@ -1935,6 +1934,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _isDisposing = true;
     WidgetsBinding.instance.removeObserver(this);
     _positionStream?.cancel();
+    _rideRequestListenerToken += 1;
     _rideRequestSubscription?.cancel();
     _rideRequestsListenerBoundCity = null;
     _driverActiveRideSubscription?.cancel();
@@ -2465,9 +2465,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     await _positionStream?.cancel();
     _positionStream = null;
-    await _rideRequestSubscription?.cancel();
-    _rideRequestSubscription = null;
-    _rideRequestsListenerBoundCity = null;
+    await _cancelRideRequestListener(reason: 'rollback_failed_go_online');
     await _stopIncomingCallMonitoring();
     _stopActiveRideListener();
     _resetDriverChatState();
@@ -6942,13 +6940,42 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _logUi('cleared invalid ride state');
   }
 
+  Future<void> _cancelRideRequestListener({
+    required String reason,
+  }) async {
+    final hadListener = _rideRequestSubscription != null;
+    final previousCity = _rideRequestsListenerBoundCity;
+    _rideRequestListenerToken += 1;
+    final invalidatedToken = _rideRequestListenerToken;
+    if (hadListener) {
+      _logRideReq(
+        'request listener cancel start reason=$reason token=$invalidatedToken market=${previousCity ?? 'none'}',
+      );
+      _log(
+        'request listener cancel start reason=$reason token=$invalidatedToken market=${previousCity ?? 'none'}',
+      );
+    }
+    final subscription = _rideRequestSubscription;
+    _rideRequestSubscription = null;
+    _rideRequestsListenerBoundCity = null;
+    await subscription?.cancel();
+    if (hadListener) {
+      _logRideReq(
+        'request listener cancelled reason=$reason token=$invalidatedToken market=${previousCity ?? 'none'}',
+      );
+      _log(
+        'request listener cancelled reason=$reason token=$invalidatedToken market=${previousCity ?? 'none'}',
+      );
+    }
+  }
+
   Future<void> _hardResetBeforeListenerAttach() async {
     await _releaseLocalPendingAssignmentIfNeeded(
       reason: 'fresh_online_session_reset',
     );
-    await _rideRequestSubscription?.cancel();
-    _rideRequestSubscription = null;
-    _rideRequestsListenerBoundCity = null;
+    await _cancelRideRequestListener(
+      reason: 'hard_reset_before_listener_attach',
+    );
     _stopActiveRideListener();
     await _clearDriverActiveRideNode(reason: 'fresh_online_session');
     _resetAllRideState();
@@ -8219,9 +8246,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     await _positionStream?.cancel();
     _positionStream = null;
 
-    await _rideRequestSubscription?.cancel();
-    _rideRequestSubscription = null;
-    _rideRequestsListenerBoundCity = null;
+    await _cancelRideRequestListener(reason: 'go_offline');
     await _stopIncomingCallMonitoring();
     _stopActiveRideListener();
     _resetDriverChatState();
@@ -8784,9 +8809,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     );
 
     Future<void> processSnapshot(
-        rtdb.DataSnapshot snapshot, {
-        required String source,
-      }) async {
+      rtdb.DataSnapshot snapshot, {
+      required String source,
+      required int listenerToken,
+    }) async {
+        if (listenerToken != _rideRequestListenerToken) {
+          _logRideReq(
+            'snapshot skipped reason=stale_listener source=$source token=$listenerToken activeToken=$_rideRequestListenerToken',
+          );
+          return;
+        }
         final raw = snapshot.value;
         final rideMap = <String, dynamic>{};
 
@@ -8798,12 +8830,45 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           });
         }
 
-        _logReqDebug('snapshot count=${rideMap.length} market=$driverCity');
-        _logDriverReq('snapshotCount=${rideMap.length} source=$source');
-        if (rideMap.isEmpty) {
+        final activeOpenRideMap = <String, Map<String, dynamic>>{};
+        for (final entry in rideMap.entries) {
+          final rideId = entry.key;
+          final rideData = _asStringDynamicMap(entry.value);
+          final status = rideData == null
+              ? 'payload_not_map'
+              : TripStateMachine.uiStatusFromSnapshot(rideData);
+          final skipReason = rideData == null
+              ? 'payload_not_map'
+              : _popupServerSkipReason(
+                      rideId,
+                      rideData,
+                      marketDiscoveryStage: true,
+                    ) ??
+                  '';
+          final qualifies = rideData != null &&
+              _serviceTypeKey(rideData['service_type']) == 'ride' &&
+              skipReason.isEmpty;
+          _logRideReq(
+            'ride discovery evaluation rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason} source=$source',
+          );
+          _logReqDebug(
+            'ride eval rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason}',
+          );
+          if (qualifies) {
+            activeOpenRideMap[rideId] = rideData;
+          }
+        }
+
+        _logReqDebug(
+          'snapshot count=${rideMap.length} activeOpen=${activeOpenRideMap.length} market=$driverCity',
+        );
+        _logDriverReq(
+          'snapshotCount=${rideMap.length} activeOpenSnapshotCount=${activeOpenRideMap.length} source=$source',
+        );
+        if (activeOpenRideMap.isEmpty) {
           _logDriverReq('candidateRideId=(none)');
         } else {
-          final keys = rideMap.keys.toList(growable: false);
+          final keys = activeOpenRideMap.keys.toList(growable: false);
           const maxKeys = 24;
           final shown = keys.length <= maxKeys
               ? keys.join(',')
@@ -8819,10 +8884,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
         var reqDebugChild = 0;
         const reqDebugChildMax = 50;
-        for (final entry in rideMap.entries) {
+        for (final entry in activeOpenRideMap.entries) {
           if (reqDebugChild >= reqDebugChildMax) {
             _logReqDebug(
-              'candidate (+${rideMap.length - reqDebugChildMax} more children not logged)',
+              'candidate (+${activeOpenRideMap.length - reqDebugChildMax} more children not logged)',
             );
             break;
           }
@@ -8846,11 +8911,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         }
 
         _logRideReq(
-          'request listener snapshot source=$source rawChildCount=${rideMap.length} market=$driverCity',
+          'request listener snapshot source=$source rawChildCount=${rideMap.length} activeOpenCount=${activeOpenRideMap.length} market=$driverCity',
         );
-        _logPopup('snapshot received count=${rideMap.length}');
-        _logDiscoveryChain('snapshot received count=${rideMap.length}');
-        if (rideMap.isEmpty) {
+        _logPopup('snapshot received raw=${rideMap.length} activeOpen=${activeOpenRideMap.length}');
+        _logDiscoveryChain(
+          'snapshot received raw=${rideMap.length} activeOpen=${activeOpenRideMap.length}',
+        );
+        if (activeOpenRideMap.isEmpty) {
           _logDiscoveryChain(
             'snapshot_empty query_market_exact=$driverCity '
             '(compare byte-for-byte to ride_requests/{rideId}/market in Firebase console)',
@@ -8858,10 +8925,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         } else {
           var loggedChildren = 0;
           const maxChildLogs = 30;
-          for (final entry in rideMap.entries) {
+          for (final entry in activeOpenRideMap.entries) {
             if (loggedChildren >= maxChildLogs) {
               _logDiscoveryChain(
-                'snapshot_children_truncated total=${rideMap.length} logged=$maxChildLogs',
+                'snapshot_children_truncated total=${activeOpenRideMap.length} logged=$maxChildLogs',
               );
               break;
             }
@@ -8974,14 +9041,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         final candidates = <_MatchedRideRequest>[];
         var skipLogBudget = 6;
         var seenLogBudget = 8;
-        for (final entry in rideMap.entries) {
-          final entryData = _asStringDynamicMap(entry.value);
-          if (entryData == null) {
-            continue;
-          }
-          if (_serviceTypeKey(entryData['service_type']) != 'ride') {
-            continue;
-          }
+        for (final entry in activeOpenRideMap.entries) {
+          final entryData = entry.value;
           if (seenLogBudget > 0) {
             seenLogBudget -= 1;
             _logRideReq('candidate seen rideId=${entry.key} service=ride');
@@ -9028,15 +9089,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         }
 
         if (candidates.isEmpty) {
-          if (rideMap.isNotEmpty) {
-            for (final entry in rideMap.entries) {
-              final ed = _asStringDynamicMap(entry.value);
-              if (ed == null) {
-                continue;
-              }
-              if (_serviceTypeKey(ed['service_type']) != 'ride') {
-                continue;
-              }
+          if (activeOpenRideMap.isNotEmpty) {
+            for (final entry in activeOpenRideMap.entries) {
+              final ed = entry.value;
               final skip = _popupServerSkipReason(
                 entry.key,
                 ed,
@@ -9052,7 +9107,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             }
           }
           _logRideReq('no candidates after filter source=$source');
-          if (rideMap.isEmpty) {
+          if (activeOpenRideMap.isEmpty) {
             _logDriverReq('skippedReason=snapshot_empty source=$source');
           } else {
             _logDriverReq(
@@ -9139,6 +9194,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     if (_rideRequestSubscription != null &&
         _rideRequestsListenerBoundCity == driverCity) {
+      final listenerToken = _rideRequestListenerToken;
       _logRideReq(
         'request listener refresh same market=$driverCity reason=$reason (prime read scheduled)',
       );
@@ -9157,7 +9213,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             market: driverCity,
             run: () => rideRequestsQuery.get(),
           );
-          await processSnapshot(snapshot, source: 'listener_refresh_$reason');
+          await processSnapshot(
+            snapshot,
+            source: 'listener_refresh_$reason',
+            listenerToken: listenerToken,
+          );
         } catch (error) {
           _logDriverReq(
             'skippedReason=listener_refresh_read_failed market=$driverCity error=$error',
@@ -9170,13 +9230,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return true;
     }
 
-    _rideRequestSubscription?.cancel();
-    _rideRequestSubscription = null;
+    await _cancelRideRequestListener(
+      reason: 'before_attach_market_$driverCity',
+    );
+    _rideRequestListenerToken += 1;
+    final listenerToken = _rideRequestListenerToken;
     _rideRequestsListenerBoundCity = driverCity;
 
     try {
       _logRideReq(
-        'request listener STREAM subscribed market=$driverCity reason=$reason',
+        'request listener STREAM subscribed market=$driverCity reason=$reason token=$listenerToken',
       );
       debugPrint(
         '[RTDB_DISCOVERY] STREAM_SUBSCRIBE path=ride_requests?orderByChild=market&equalTo=$driverCity '
@@ -9185,7 +9248,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _rideRequestSubscription = rideRequestsQuery.onValue.listen(
         (event) async {
           try {
-            await processSnapshot(event.snapshot, source: 'stream');
+            await processSnapshot(
+              event.snapshot,
+              source: 'stream',
+              listenerToken: listenerToken,
+            );
           } catch (error) {
             _log('ride listener snapshot handling failed error=$error');
             _logRideReq('snapshot handler ERROR source=stream error=$error');
@@ -9202,9 +9269,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           _logRideReq('request listener stream ERROR market=$driverCity error=$error');
           if (isRealtimeDatabasePermissionDenied(error)) {
             _logDriverReq('skippedReason=rtdb_permission_denied_stream error=$error');
-            unawaited(_rideRequestSubscription?.cancel());
-            _rideRequestSubscription = null;
-            _rideRequestsListenerBoundCity = null;
+            unawaited(
+              _cancelRideRequestListener(
+                reason: 'permission_denied_stream_market_$driverCity',
+              ),
+            );
             _logRtdb(
               'ride_requests query permission denied — check RTDB rules (drivers node + market query) and deploy database.rules.json',
             );
@@ -9227,7 +9296,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           market: driverCity,
           run: () => rideRequestsQuery.get(),
         );
-        await processSnapshot(primeSnapshot, source: 'prime_get');
+        await processSnapshot(
+          primeSnapshot,
+          source: 'prime_get',
+          listenerToken: listenerToken,
+        );
         _logRideReq('request listener PRIME get finished market=$driverCity');
         _logReqDebug('listener attach OK market=$driverCity');
       } catch (error) {
