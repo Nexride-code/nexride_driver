@@ -10268,15 +10268,21 @@ class _DriverMapScreenState extends State<DriverMapScreen>
                       onPressed: isAccepting || !canAcceptService
                           ? null
                           : () async {
+                              if (isAccepting) {
+                                return;
+                              }
+                              isAccepting = true;
                               final acceptRequestedAt =
                                   DateTime.now().millisecondsSinceEpoch;
+                              _logRideReq(
+                                '[MATCH_DEBUG][ACCEPT_TAP] rideId=${activePopupRide.rideId} '
+                                'driverId=$_effectiveDriverId ts=$acceptRequestedAt',
+                              );
                               _logRtdb(
                                 'accept tapped rideId=${activePopupRide.rideId} driverId=$_effectiveDriverId',
                               );
                               _clearRidePopupTimer();
-                              setDialogState(() {
-                                isAccepting = true;
-                              });
+                              setDialogState(() {});
                               final accepted = await _acceptRide(
                                 activePopupRide.rideId,
                                 driverName: driverName,
@@ -10294,15 +10300,28 @@ class _DriverMapScreenState extends State<DriverMapScreen>
                               );
                             },
                       child: isAccepting
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                valueColor: AlwaysStoppedAnimation<Color>(
-                                  Colors.black,
+                          ? const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    valueColor: AlwaysStoppedAnimation<Color>(
+                                      Colors.black,
+                                    ),
+                                  ),
                                 ),
-                              ),
+                                SizedBox(width: 10),
+                                Text(
+                                  'Accepting…',
+                                  style: TextStyle(
+                                    color: Colors.black,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ],
                             )
                           : const Text(
                               'ACCEPT',
@@ -10402,12 +10421,19 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     int? acceptRequestedAt,
   }) async {
     if (!_isValidRideId(rideId)) {
+      _logRideReq(
+        '[MATCH_DEBUG][ACCEPT_LOCK_FAIL] rideId=$rideId reason=ride_id_missing',
+      );
       _logRtdb('accept blocked rideId=$rideId reason=ride_id_missing');
       return false;
     }
 
     final popupRideId = _activePopupRideId;
     if (popupRideId != null && popupRideId != rideId) {
+      _logRideReq(
+        '[MATCH_DEBUG][ACCEPT_LOCK_FAIL] rideId=$rideId reason=popup_request_mismatch '
+        'popupRideId=$popupRideId',
+      );
       _logRtdb(
         'accept blocked rideId=$rideId reason=popup_request_mismatch popupRideId=$popupRideId',
       );
@@ -10415,6 +10441,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     if (_acceptingPopupRideId == rideId) {
+      _logRideReq(
+        '[MATCH_DEBUG][ACCEPT_LOCK_FAIL] rideId=$rideId reason=accept_already_in_flight',
+      );
       _logRtdb('accept blocked rideId=$rideId reason=accept_in_flight');
       return false;
     }
@@ -10440,6 +10469,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (_effectiveDriverId.isEmpty ||
         FirebaseAuth.instance.currentUser?.uid != _effectiveDriverId ||
         !_isOnline) {
+      _logRideReq(
+        '[MATCH_DEBUG][ACCEPT_LOCK_FAIL] rideId=$rideId reason=driver_not_ready',
+      );
       _logRtdb('accept blocked rideId=$rideId reason=driver_not_ready');
       _showSnackBarSafely(
         const SnackBar(
@@ -10469,6 +10501,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     );
     try {
       String blockedReason = 'unknown';
+      var acceptLockWasIdempotent = false;
       final startTimeoutAt = DateTime.now().millisecondsSinceEpoch +
           TripStateMachine.acceptedToStartTimeout.inMilliseconds;
       final transactionResult = await ref.runTransaction((currentData) {
@@ -10485,6 +10518,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         final currentDriverId = _valueAsText(current['driver_id']);
         if (currentDriverId == _effectiveDriverId &&
             TripStateMachine.isDriverActiveState(currentCanonicalState)) {
+          acceptLockWasIdempotent = true;
           return rtdb.Transaction.success(Map<String, dynamic>.from(current));
         }
         if (!TripStateMachine.isPendingDriverAssignmentState(
@@ -10543,11 +10577,19 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               ? latestRideData
               : null;
 
+      if (!transactionResult.committed && committedRideData != null) {
+        acceptLockWasIdempotent = true;
+      }
+
       if (committedRideData == null) {
         final latestBlockedReason = blockedReason != 'unknown'
             ? blockedReason
             : _acceptBlockedReasonFromRideData(rideId, latestRideData);
         _logRtdb('accept blocked rideId=$rideId reason=$latestBlockedReason');
+        _logRideReq(
+          '[MATCH_DEBUG][ACCEPT_LOCK_FAIL] rideId=$rideId reason=$latestBlockedReason '
+          'committed=${transactionResult.committed}',
+        );
         _logRideReq(
           '[MATCH_DEBUG][DRIVER_DECISION] decision=rejected rideId=$rideId '
           'status=${latestRideData == null ? 'unknown' : TripStateMachine.uiStatusFromSnapshot(latestRideData)} '
@@ -10594,6 +10636,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           _logRtdb(
             'accept blocked rideId=$rideId reason=committed_payload_invalid',
           );
+          _logRideReq(
+            '[MATCH_DEBUG][ACCEPT_LOCK_FAIL] rideId=$rideId reason=committed_payload_invalid '
+            'detail=$committedRideReason',
+          );
           await _clearActiveRideState(
             reason: 'accepted_payload_invalid',
             resetTripState: true,
@@ -10612,6 +10658,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
       final committedStatus =
           TripStateMachine.uiStatusFromSnapshot(validatedCommittedRideData);
+      _logRideReq(
+        '[MATCH_DEBUG][ACCEPT_LOCK_OK] rideId=$rideId driverId=$_effectiveDriverId '
+        'idempotent=$acceptLockWasIdempotent rtdb_committed=${transactionResult.committed} '
+        'trip_state=$committedCanonicalForCommit ui_status=$committedStatus',
+      );
 
       await _commitRideAndDriverState(
         rideId: rideId,
@@ -10629,6 +10680,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           'trip_state': committedCanonicalForCommit,
           'updated_at': rtdb.ServerValue.timestamp,
         },
+      );
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_ACTIVE_TRIP] rideId=$rideId driverId=$_effectiveDriverId '
+        'ui_status=$committedStatus trip_state=$committedCanonicalForCommit',
       );
       _trackRideForCurrentSession(rideId);
       _startCallListener(rideId);
@@ -10702,6 +10757,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       if (_currentRideId != rideId) {
         _driverActiveRideId = null;
       }
+      _logRideReq(
+        '[MATCH_DEBUG][ACCEPT_LOCK_FAIL] rideId=$rideId reason=exception '
+        'type=${error.runtimeType}',
+      );
       _logRtdb(
         'accept write failed rideId=$rideId exact_error_type=${error.runtimeType} exact_error=$error',
       );
