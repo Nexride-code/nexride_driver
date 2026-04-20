@@ -282,6 +282,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   /// City key for the active [ride_requests] market query (null if no listener).
   String? _rideRequestsListenerBoundCity;
   int _rideRequestListenerToken = 0;
+  /// Serializes discovery attach/cancel so two callers cannot overlap native query setup.
+  Future<void> _rideDiscoveryAttachChain = Future<void>.value();
   StreamSubscription<rtdb.DatabaseEvent>? _driverActiveRideSubscription;
   StreamSubscription<rtdb.DatabaseEvent>? _activeRideSubscription;
   final List<StreamSubscription<rtdb.DatabaseEvent>> _driverChatSubscriptions =
@@ -812,7 +814,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         },
       );
 
-      _startIncomingCallListener();
       unawaited(_resyncIncomingCallState());
       await _listenToActiveRide(recoveredRide.rideId);
       _startLiveLocationStream();
@@ -1624,6 +1625,40 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
   }
 
+  /// One-shot read of `ride_requests/{rideId}` that never overlaps iOS-native
+  /// `onValue` on the **same** child ref (Firebase iOS: tracked-keys assertion).
+  Future<rtdb.DataSnapshot> _rideRequestChildGetIosSafe(
+    String rideId,
+    String op,
+  ) async {
+    final normalized = rideId.trim();
+    _logRideReq('[MATCH_DEBUG][QUERY_GET:ride_requests/$normalized] op=$op');
+    final conflictingListener = _activeRideListenerRideId == normalized &&
+        _activeRideSubscription != null;
+    if (!conflictingListener) {
+      return _rideRequestsRef.child(normalized).get();
+    }
+    _logRideReq(
+      '[MATCH_DEBUG][QUERY_PAUSE:ride_requests/$normalized] op=$op '
+      'reason=avoid_get_while_active_ride_onvalue',
+    );
+    final sub = _activeRideSubscription;
+    await sub?.cancel();
+    _activeRideSubscription = null;
+    _activeRideListenerRideId = null;
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    try {
+      return await _rideRequestsRef.child(normalized).get();
+    } finally {
+      if (conflictingListener && mounted && _isValidRideId(normalized)) {
+        _logRideReq(
+          '[MATCH_DEBUG][QUERY_ATTACH:ride_requests/$normalized] op=$op resume_onvalue',
+        );
+        await _listenToActiveRide(normalized);
+      }
+    }
+  }
+
   /// Temporary popup lifecycle trace (filter by `[POPUP_FIX]`).
   void _logPopupFix(String message) {
     debugPrint('[POPUP_FIX] $message');
@@ -1976,7 +2011,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (_canMonitorRideCalls &&
         rideIdForCallMonitoring != null &&
         rideIdForCallMonitoring.isNotEmpty) {
-      _startIncomingCallListener();
       unawaited(_resyncIncomingCallState());
     }
     unawaited(_syncCallForegroundState(foreground: true));
@@ -4247,6 +4281,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return;
     }
 
+    _logRideReq(
+      '[MATCH_DEBUG][QUERY_ATTACH:calls?orderByChild=receiverId&equalTo=$driverId] '
+      'incoming_calls onValue',
+    );
     _incomingCallSubscription =
         _callService.observeCallsForReceiver(driverId).listen(
       (event) {
@@ -4297,8 +4335,31 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return;
     }
 
-    final sessions = await _callService.fetchCallsForReceiver(driverId);
-    if (!mounted) {
+    // iOS: never run Query.get() on calls?receiverId=… while observeCallsForReceiver
+    // (same query) is active — detach first, then fetch, then re-attach.
+    if (_incomingCallSubscription != null) {
+      _logRideReq(
+        '[MATCH_DEBUG][QUERY_DETACH:calls?orderByChild=receiverId&equalTo=$driverId] '
+        'incoming_calls resync_prefetch',
+      );
+      await _incomingCallSubscription?.cancel();
+      _incomingCallSubscription = null;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+
+    _logRideReq(
+      '[MATCH_DEBUG][QUERY_GET:calls?orderByChild=receiverId&equalTo=$driverId] '
+      'fetchCallsForReceiver resync',
+    );
+    List<RideCallSession> sessions;
+    try {
+      sessions = await _callService.fetchCallsForReceiver(driverId);
+    } catch (error) {
+      _logRideCall('incoming resync fetch failed driverId=$driverId error=$error');
+      sessions = const <RideCallSession>[];
+    }
+
+    if (!mounted || !_canMonitorRideCalls || driverId.isEmpty) {
       return;
     }
 
@@ -4308,11 +4369,17 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       if (session != null && _isIncomingCall(session)) {
         await _resyncCallState(session.rideId);
       }
-      return;
+    } else {
+      _startCallListener(nextSession.rideId);
+      await _handleCallSnapshotUpdate(nextSession.rideId, nextSession);
     }
 
-    _startCallListener(nextSession.rideId);
-    await _handleCallSnapshotUpdate(nextSession.rideId, nextSession);
+    if (!mounted || !_canMonitorRideCalls || driverId.isEmpty) {
+      return;
+    }
+    if (_incomingCallSubscription == null) {
+      _startIncomingCallListener();
+    }
   }
 
   RideCallSession? _pickIncomingCallForDriver(List<RideCallSession> sessions) {
@@ -4352,6 +4419,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _callSubscription = null;
     _callListenerRideId = rideId;
 
+    _logRideReq('[MATCH_DEBUG][QUERY_ATTACH:calls/$rideId] per_ride onValue');
     _callSubscription = _callService.observeCall(rideId).listen(
       (event) {
         if (_callListenerRideId != rideId) {
@@ -4371,12 +4439,36 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   }
 
   Future<void> _resyncCallState(String rideId) async {
-    final session = await _callService.fetchCall(rideId);
-    if (!mounted || _callListenerRideId != rideId) {
+    final normalizedRideId = rideId.trim();
+    if (normalizedRideId.isEmpty) {
       return;
     }
 
-    await _handleCallSnapshotUpdate(rideId, session);
+    final resumePerRideListener = _callSubscription != null &&
+        _callListenerRideId == normalizedRideId;
+    if (resumePerRideListener) {
+      _logRideReq(
+        '[MATCH_DEBUG][QUERY_DETACH:calls/$normalizedRideId] resync_prefetch',
+      );
+      await _callSubscription?.cancel();
+      _callSubscription = null;
+      _callListenerRideId = null;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+
+    _logRideReq(
+      '[MATCH_DEBUG][QUERY_GET:calls/$normalizedRideId] fetchCall resync',
+    );
+    final session = await _callService.fetchCall(normalizedRideId);
+    if (!mounted) {
+      return;
+    }
+
+    await _handleCallSnapshotUpdate(normalizedRideId, session);
+
+    if (resumePerRideListener && _canMonitorRideCalls) {
+      _startCallListener(normalizedRideId);
+    }
   }
 
   Future<void> _handleCallSnapshotUpdate(
@@ -6376,6 +6468,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     final activeRideRef = _driverActiveRideRef.child(driverId);
+    var pausedDriverActiveListener = false;
     try {
       if (rideId == null || rideId.trim().isEmpty) {
         _driverActiveRideId = null;
@@ -6385,6 +6478,19 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         return;
       }
 
+      if (_driverActiveRideSubscription != null) {
+        pausedDriverActiveListener = true;
+        _logRideReq(
+          '[MATCH_DEBUG][QUERY_PAUSE:driver_active_ride/$driverId] '
+          'clear_driver_active_ride_node_read',
+        );
+        await _driverActiveRideSubscription?.cancel();
+        _driverActiveRideSubscription = null;
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+      _logRideReq(
+        '[MATCH_DEBUG][QUERY_GET:driver_active_ride/$driverId] clear_node_read',
+      );
       final snapshot = await activeRideRef.get();
       final activeRideData = _asStringDynamicMap(snapshot.value);
       final activeRideId = _valueAsText(activeRideData?['ride_id']);
@@ -6408,6 +6514,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         return;
       }
       rethrow;
+    } finally {
+      if (pausedDriverActiveListener &&
+          driverId.isNotEmpty &&
+          _isOnline &&
+          _onlineSessionStartedAt > 0) {
+        await _startDriverActiveRideListener();
+      }
     }
   }
 
@@ -6588,8 +6701,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     if (!transactionResult.committed) {
       final latestRideData =
-          _asStringDynamicMap(transactionResult.snapshot.value) ??
-              _asStringDynamicMap((await rideRef.get()).value);
+          _asStringDynamicMap(transactionResult.snapshot.value);
       final latestBlockedReason = blockedReason != 'unknown'
           ? blockedReason
           : (_popupServerSkipReason(ride.rideId, latestRideData) ??
@@ -6606,8 +6718,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     final reservedRideData =
-        _asStringDynamicMap(transactionResult.snapshot.value) ??
-            _asStringDynamicMap((await rideRef.get()).value);
+        _asStringDynamicMap(transactionResult.snapshot.value);
     if (reservedRideData == null) {
       return null;
     }
@@ -6796,6 +6907,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     await _driverActiveRideSubscription?.cancel();
+    _logRideReq(
+      '[MATCH_DEBUG][QUERY_ATTACH:driver_active_ride/$driverId] onValue',
+    );
     _driverActiveRideSubscription =
         _driverActiveRideRef.child(driverId).onValue.listen(
       (event) async {
@@ -6859,7 +6973,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               );
               return;
             }
-            final rideSnapshot = await _rideRequestsRef.child(rideId).get();
+            final rideSnapshot = await _rideRequestChildGetIosSafe(
+              rideId,
+              'driver_active_ride_pending_fetch',
+            );
             final rideData = _asStringDynamicMap(rideSnapshot.value);
             if (rideData == null) {
               await _clearDriverActiveRideNode(
@@ -6981,6 +7098,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     await subscription?.cancel();
     if (hadListener) {
       _logRideReq(
+        '[MATCH_DEBUG][QUERY_DETACH:ride_requests?orderByChild=market&equalTo=${previousCity ?? 'none'}] '
+        'discovery reason=$reason',
+      );
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_DETACH] reason=$reason token=$invalidatedToken market=${previousCity ?? 'none'}',
+      );
+      _logRideReq(
         'request listener cancelled reason=$reason token=$invalidatedToken market=${previousCity ?? 'none'}',
       );
       _log(
@@ -7063,6 +7187,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     await _activeRideSubscription?.cancel();
     _activeRideSubscription = null;
     _activeRideListenerRideId = rideId;
+    _logRideReq(
+      '[MATCH_DEBUG][QUERY_ATTACH:ride_requests/$rideId] active_ride onValue',
+    );
     _activeRideSubscription = _rideRequestsRef.child(rideId).onValue.listen(
       (event) async {
         try {
@@ -7719,7 +7846,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     bool logSkips = true,
     bool ignoreLocalState = false,
   }) async {
-    final snapshot = await _rideRequestsRef.child(rideId).get();
+    final snapshot =
+        await _rideRequestChildGetIosSafe(rideId, 'load_live_popup_ride');
     final liveRide = _matchRideForPopup(
       rideId,
       snapshot.value,
@@ -8739,6 +8867,17 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   }
 
   Future<bool> _listenForRideRequests({required String reason}) async {
+    final captured = <bool>[false];
+    _rideDiscoveryAttachChain = _rideDiscoveryAttachChain
+        .catchError((Object _) {})
+        .then<void>((_) async {
+      captured[0] = await _listenForRideRequestsImpl(reason: reason);
+    });
+    await _rideDiscoveryAttachChain;
+    return captured[0];
+  }
+
+  Future<bool> _listenForRideRequestsImpl({required String reason}) async {
     _logRideReq('request listener attach attempt reason=$reason');
     _logRideReqContext('pre-bind');
     _logReqDebug(
@@ -9015,7 +9154,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               op: 'ride_requests_child_get_active_popup',
               path: 'ride_requests/$activePopupRideId',
               market: driverCity,
-              run: () => _rideRequestsRef.child(activePopupRideId).get(),
+              run: () => _rideRequestChildGetIosSafe(
+                activePopupRideId,
+                'ride_requests_child_get_active_popup',
+              ),
             );
             activePopupRideData = _asStringDynamicMap(latestSnapshot.value);
           }
@@ -9166,7 +9308,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           op: 'ride_requests_child_get_pre_popup_recheck',
           path: 'ride_requests/${matchedRide.rideId}',
           market: driverCity,
-          run: () => _rideRequestsRef.child(matchedRide.rideId).get(),
+          run: () => _rideRequestChildGetIosSafe(
+            matchedRide.rideId,
+            'ride_requests_child_get_pre_popup_recheck',
+          ),
         );
         final recheckedRide = _matchRideForPopup(
           matchedRide.rideId,
@@ -9240,45 +9385,30 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     if (_rideRequestSubscription != null &&
         _rideRequestsListenerBoundCity == driverCity) {
-      final listenerToken = _rideRequestListenerToken;
       _logRideReq(
-        'request listener refresh same market=$driverCity reason=$reason (prime read scheduled)',
+        'request listener refresh same market=$driverCity reason=$reason '
+        '(no extra .get — iOS avoids concurrent query.get + onValue on same Query)',
       );
-      _logPopup('listener already bound market=$driverCity refresh scheduled');
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_ATTACH] noop_refresh market=$driverCity reason=$reason '
+        'activeStream=true',
+      );
+      _logPopup('listener already bound market=$driverCity refresh noop');
       _logDiscoveryChain(
         'online attach refresh (already bound) market=$driverCity reason=$reason',
       );
       _logRtdb(
         'ride request listener refresh city=$driverCity reason=$reason',
       );
-      unawaited(() async {
-        try {
-          final snapshot = await _logDiscoveryRtdbRead(
-            op: 'ride_requests_refresh_get',
-            path: 'ride_requests?orderByChild=market&equalTo=$driverCity',
-            market: driverCity,
-            run: () => rideRequestsQuery.get(),
-          );
-          await queueSnapshotProcessing(
-            snapshot,
-            source: 'listener_refresh_$reason',
-            listenerToken: listenerToken,
-          );
-        } catch (error) {
-          _logDriverReq(
-            'skippedReason=listener_refresh_read_failed market=$driverCity error=$error',
-          );
-          _logRtdb(
-            'listener refresh read failed city=$driverCity reason=$reason error=$error',
-          );
-        }
-      }());
       return true;
     }
 
     await _cancelRideRequestListener(
       reason: 'before_attach_market_$driverCity',
     );
+    // Let the native RTDB client finish tearing down the previous query before
+    // registering a new ValueEventListener (iOS: tracked-keys assertion).
+    await Future<void>.delayed(const Duration(milliseconds: 50));
     _rideRequestListenerToken += 1;
     final listenerToken = _rideRequestListenerToken;
     _rideRequestsListenerBoundCity = driverCity;
@@ -9290,6 +9420,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       debugPrint(
         '[RTDB_DISCOVERY] STREAM_SUBSCRIBE path=ride_requests?orderByChild=market&equalTo=$driverCity '
         'market=$driverCity authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'}',
+      );
+      _logRideReq(
+        '[MATCH_DEBUG][QUERY_ATTACH:ride_requests?orderByChild=market&equalTo=$driverCity] '
+        'discovery onValue',
       );
       _rideRequestSubscription = rideRequestsQuery.onValue.listen(
         (event) async {
@@ -9333,30 +9467,18 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           }
         },
       );
-      try {
-        _logRtdb('listener prime read started city=$driverCity');
-        _logRideReq('request listener PRIME get started market=$driverCity');
-        final primeSnapshot = await _logDiscoveryRtdbRead(
-          op: 'ride_requests_prime_get',
-          path: 'ride_requests?orderByChild=market&equalTo=$driverCity',
-          market: driverCity,
-          run: () => rideRequestsQuery.get(),
-        );
-        await queueSnapshotProcessing(
-          primeSnapshot,
-          source: 'prime_get',
-          listenerToken: listenerToken,
-        );
-        _logRideReq('request listener PRIME get finished market=$driverCity');
-        _logReqDebug('listener attach OK market=$driverCity');
-      } catch (error) {
-        _logReqDebug('listener attach FAIL error=$error');
-        _logDriverReq(
-          'skippedReason=prime_read_failed market=$driverCity error=$error',
-        );
-        _logRtdb('listener prime read failed city=$driverCity error=$error');
-        _logRideReq('request listener PRIME FAILED market=$driverCity error=$error');
-      }
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_ATTACH] market=$driverCity token=$listenerToken '
+        'reason=$reason prime_get=skipped_ios_safe',
+      );
+      _logRtdb(
+        'listener prime skipped (onValue initial snapshot only) city=$driverCity',
+      );
+      _logRideReq(
+        'request listener PRIME skipped market=$driverCity '
+        '(rely on onValue only; no query.get while listener active)',
+      );
+      _logReqDebug('listener attach OK market=$driverCity');
       _logPopup('online attach success');
       _logDiscoveryChain('online attach success market=$driverCity reason=$reason');
       return true;
@@ -9766,8 +9888,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logRtdb(
         'popup shown rideId=${activePopupRide.rideId} countdown=$_kRidePopupCountdownSeconds',
       );
-      final preShowSnapshot =
-          await _rideRequestsRef.child(activePopupRide.rideId).get();
+      final preShowSnapshot = await _rideRequestChildGetIosSafe(
+        activePopupRide.rideId,
+        'popup_pre_dialog_gate',
+      );
       final preShowBlock = _popupHardGateBeforeDialog(
         activePopupRide.rideId,
         preShowSnapshot.value,
@@ -10412,11 +10536,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
       final latestRideData = transactionResult.committed
           ? null
-          : _asStringDynamicMap(transactionResult.snapshot.value) ??
-              _asStringDynamicMap((await ref.get()).value);
+          : _asStringDynamicMap(transactionResult.snapshot.value);
       final committedRideData = transactionResult.committed
-          ? _asStringDynamicMap(transactionResult.snapshot.value) ??
-              _asStringDynamicMap((await ref.get()).value)
+          ? _asStringDynamicMap(transactionResult.snapshot.value)
           : _rideAlreadyAcceptedByCurrentDriver(latestRideData)
               ? latestRideData
               : null;

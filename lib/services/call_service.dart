@@ -214,6 +214,10 @@ class CallService {
   Future<RideCallSession?> fetchCall(String rideId) async {
     final normalizedRideId = rideId.trim();
     await _keepRideCallSynced(normalizedRideId);
+    debugPrint(
+      '[MATCH_DEBUG][QUERY_GET:calls/$normalizedRideId] fetchCall '
+      '(caller must not overlap observeCall on same ref)',
+    );
     final snapshot = await runOptionalRealtimeDatabaseRead<rtdb.DataSnapshot>(
       source: 'driver_call.fetch_call',
       path: 'calls/$normalizedRideId',
@@ -228,6 +232,10 @@ class CallService {
   Future<List<RideCallSession>> fetchCallsForReceiver(String receiverId) async {
     final normalizedReceiverId = receiverId.trim();
     await _keepReceiverCallsSynced(normalizedReceiverId);
+    debugPrint(
+      '[MATCH_DEBUG][QUERY_GET:calls?orderByChild=receiverId&equalTo=$normalizedReceiverId] '
+      'fetchCallsForReceiver (caller must not overlap observeCallsForReceiver)',
+    );
     final snapshot = await runOptionalRealtimeDatabaseRead<rtdb.DataSnapshot>(
       source: 'driver_call.fetch_calls_for_receiver',
       path: 'calls[orderByChild=receiverId,equalTo=$normalizedReceiverId]',
