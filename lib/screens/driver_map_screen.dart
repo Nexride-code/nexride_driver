@@ -6698,6 +6698,89 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
   }
 
+  /// Success for [ride_requests] + [drivers] only (no [driver_active_ride],
+  /// telemetry, or route logs). Used after accept transaction commits.
+  Future<void> _commitCriticalRideAndDriverSnapshot({
+    required String rideId,
+    required Map<String, dynamic> rideUpdates,
+    required Map<String, Object?> driverUpdates,
+  }) async {
+    final driverId = _effectiveDriverId;
+    if (driverId.isEmpty) {
+      throw StateError('missing_driver_id');
+    }
+
+    final primaryUpdates = <String, Object?>{};
+    rideUpdates.forEach((key, value) {
+      primaryUpdates['ride_requests/$rideId/$key'] = value;
+    });
+    driverUpdates.forEach((key, value) {
+      primaryUpdates['drivers/$driverId/$key'] = value;
+    });
+
+    _logRtdb(
+      'critical post-accept update start rideId=$rideId '
+      'rideKeys=${rideUpdates.keys.length} driverKeys=${driverUpdates.keys.length}',
+    );
+    try {
+      await rtdb.FirebaseDatabase.instance.ref().update(primaryUpdates);
+      _logRtdb('critical post-accept update success rideId=$rideId');
+    } catch (error) {
+      final code = error is FirebaseException ? error.code : 'unknown';
+      _logRtdb(
+        '[RTDB_WRITE] phase=error operation=critical_post_accept_update '
+        'rideId=$rideId uid=$driverId paths=ride_requests+drivers code=$code error=$error',
+      );
+      _logRtdb('critical post-accept update failure rideId=$rideId error=$error');
+      rethrow;
+    }
+  }
+
+  void _scheduleOptionalPostAcceptRtdbMirrors({
+    required String rideId,
+    required String committedStatus,
+    required String committedCanonicalForCommit,
+  }) {
+    final driverId = _effectiveDriverId;
+    if (driverId.isEmpty) {
+      return;
+    }
+
+    final latestTripPaths = <String, Object?>{
+      'drivers/$driverId/latest_trip_ride_id': rideId,
+      'drivers/$driverId/latest_trip_status': committedStatus,
+      'drivers/$driverId/latest_trip_trip_state': committedCanonicalForCommit,
+      'drivers/$driverId/latest_trip_at': rtdb.ServerValue.timestamp,
+    };
+    unawaited(
+      runOptionalRealtimeDatabaseWrite(
+        source: 'driver_map.post_accept_latest_trip',
+        path: 'drivers/$driverId',
+        operation: 'merge',
+        rideId: rideId,
+        action: () =>
+            rtdb.FirebaseDatabase.instance.ref().update(latestTripPaths),
+      ),
+    );
+
+    final secondaryUpdates = <String, Object?>{
+      'driver_active_ride/$driverId/ride_id': rideId,
+      'driver_active_ride/$driverId/status': committedStatus,
+      'driver_active_ride/$driverId/trip_state': committedCanonicalForCommit,
+      'driver_active_ride/$driverId/updated_at': rtdb.ServerValue.timestamp,
+    };
+    unawaited(
+      runOptionalRealtimeDatabaseWrite(
+        source: 'driver_map.post_accept_driver_active_ride',
+        path: 'driver_active_ride/$driverId',
+        operation: 'merge',
+        rideId: rideId,
+        action: () =>
+            rtdb.FirebaseDatabase.instance.ref().update(secondaryUpdates),
+      ),
+    );
+  }
+
   Map<String, Object?> _buildDriverPresenceUpdate({
     required String status,
     String? activeRideId,
@@ -6937,6 +7020,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (driverId.isEmpty || !_isValidRideId(rideId)) {
       return false;
     }
+
+    _logRideReq(
+      '[MATCH_DEBUG][ASSIGNMENT_RELEASE] rideId=$rideId driverId=$driverId reason=$reason',
+    );
 
     final rideRef = _rideRequestsRef.child(rideId);
     late final rtdb.TransactionResult transactionResult;
@@ -9871,6 +9958,19 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return;
     }
 
+    final dedupRideId = ride.rideId.trim();
+    if (_presentedRideIds.contains(dedupRideId) &&
+        _activePopupRideId != dedupRideId) {
+      _logRideReq(
+        '[MATCH_DEBUG][POPUP_DEDUP] rideId=$dedupRideId '
+        'source=showRideRequestPopup_entry reason=already_presented_elsewhere',
+      );
+      _logRidePopup(
+        'skip rideId=$dedupRideId reason=popup_dedup_same_ride_id',
+      );
+      return;
+    }
+
     if (!_isOnline) {
       _logRidePopup(
         'skip rideId=${ride.rideId} reason=driver_offline',
@@ -10662,12 +10762,21 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _presentedRideIds.remove(ride.rideId.trim());
       }
       if (rideReserved && !rideAccepted) {
-        await _releaseAssignedRideIfNeeded(
-          rideId: ride.rideId,
-          reason: popupTimedOut
-              ? 'driver_response_timeout'
-              : (_popupDismissedReason ?? 'driver_declined'),
-        );
+        final rid = ride.rideId.trim();
+        if (_terminalSelfAcceptedRideIds.contains(rid) ||
+            _foreverSuppressedRidePopupIds.contains(rid)) {
+          _logRideReq(
+            '[MATCH_DEBUG][ASSIGNMENT_RELEASE_SKIPPED] rideId=$rid '
+            'reason=accept_terminal_or_forever_lock popupTimedOut=$popupTimedOut',
+          );
+        } else {
+          await _releaseAssignedRideIfNeeded(
+            rideId: ride.rideId,
+            reason: popupTimedOut
+                ? 'driver_response_timeout'
+                : (_popupDismissedReason ?? 'driver_declined'),
+          );
+        }
       }
       _popupOpen = false;
       _hasActivePopup = false;
@@ -10775,6 +10884,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       var acceptLockWasIdempotent = false;
       final startTimeoutAt = DateTime.now().millisecondsSinceEpoch +
           TripStateMachine.acceptedToStartTimeout.inMilliseconds;
+      _logRideReq(
+        '[MATCH_DEBUG][ACCEPT_START] rideId=$rideId driverId=$_effectiveDriverId',
+      );
       _logRideReq(
         '[MATCH_DEBUG][ACCEPT_TX_BEGIN] rideId=$rideId driverId=$_effectiveDriverId',
       );
@@ -10895,6 +11007,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           'status=${latestRideData == null ? 'unknown' : TripStateMachine.uiStatusFromSnapshot(latestRideData)} '
           'reason=$latestBlockedReason stage=accept',
         );
+        _logRideReq(
+          '[MATCH_DEBUG][ACCEPT_FAIL] rideId=$rideId reason=$latestBlockedReason '
+          'phase=transaction',
+        );
         if (_rideBelongsToAnotherDriver(latestRideData)) {
           _logRtdb('accept lost rideId=$rideId');
         }
@@ -10945,6 +11061,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             '[MATCH_DEBUG][ACCEPT_LOCK_FAIL] rideId=$rideId reason=committed_payload_invalid '
             'detail=$committedRideReason',
           );
+          _logRideReq(
+            '[MATCH_DEBUG][ACCEPT_FAIL] rideId=$rideId reason=committed_payload_invalid '
+            'detail=$committedRideReason phase=post_tx_validation',
+          );
           await _clearActiveRideState(
             reason: 'accepted_payload_invalid',
             resetTripState: true,
@@ -10970,42 +11090,57 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
 
       final rid = rideId.trim();
-      _terminalSelfAcceptedRideIds.add(rid);
-      _logRideReq(
-        '[MATCH_DEBUG][ACCEPT_SUCCESS] rideId=$rideId driverId=$_effectiveDriverId '
-        'trip_state=$committedCanonicalForCommit ui_status=$committedStatus',
+      var criticalPostAcceptSyncOk = false;
+      final driverPresenceCritical = _buildDriverPresenceUpdate(
+        status: committedStatus,
+        activeRideId: rideId,
+        isAvailable: false,
       );
+      try {
+        await _commitCriticalRideAndDriverSnapshot(
+          rideId: rideId,
+          rideUpdates: <String, dynamic>{
+            'driver_state_synced_at': rtdb.ServerValue.timestamp,
+          },
+          driverUpdates: driverPresenceCritical,
+        );
+        criticalPostAcceptSyncOk = true;
+      } catch (error, stackTrace) {
+        _logRideReq(
+          '[MATCH_DEBUG][ACCEPT_FAIL] rideId=$rideId phase=critical_post_accept_rtdb '
+          'error=$error',
+        );
+        _logRtdb(
+          'critical post-accept sync failed rideId=$rideId error=$error '
+          '(ride_requests accept already committed — not releasing assignment)',
+        );
+        debugPrintStack(
+          label: 'critical post-accept sync',
+          stackTrace: stackTrace,
+        );
+      }
+
+      _terminalSelfAcceptedRideIds.add(rid);
       _foreverSuppressedRidePopupIds.add(rid);
       _suppressedRidePopupIds.add(rid);
       _presentedRideIds.remove(rid);
       _logRideReq(
         '[MATCH_DEBUG][POPUP_SUPPRESSED_ACCEPTED] rideId=$rideId driverId=$_effectiveDriverId '
-        'trip_state=$committedCanonicalForCommit',
+        'trip_state=$committedCanonicalForCommit '
+        'critical_rtdb_sync_ok=$criticalPostAcceptSyncOk',
       );
       _trackRideForCurrentSession(rideId);
 
-      final driverPresence = _buildDriverPresenceUpdate(
-        status: committedStatus,
-        activeRideId: rideId,
-        isAvailable: false,
-      );
-      driverPresence['latest_trip_ride_id'] = rideId;
-      driverPresence['latest_trip_status'] = committedStatus;
-      driverPresence['latest_trip_trip_state'] = committedCanonicalForCommit;
-      driverPresence['latest_trip_at'] = rtdb.ServerValue.timestamp;
-
-      await _commitRideAndDriverState(
+      _scheduleOptionalPostAcceptRtdbMirrors(
         rideId: rideId,
-        rideUpdates: <String, dynamic>{
-          'driver_state_synced_at': rtdb.ServerValue.timestamp,
-        },
-        driverUpdates: driverPresence,
-        activeRideUpdates: <String, Object?>{
-          'ride_id': rideId,
-          'status': committedStatus,
-          'trip_state': committedCanonicalForCommit,
-          'updated_at': rtdb.ServerValue.timestamp,
-        },
+        committedStatus: committedStatus,
+        committedCanonicalForCommit: committedCanonicalForCommit,
+      );
+
+      _logRideReq(
+        '[MATCH_DEBUG][ACCEPT_SUCCESS] rideId=$rideId driverId=$_effectiveDriverId '
+        'trip_state=$committedCanonicalForCommit ui_status=$committedStatus '
+        'critical_rtdb_sync_ok=$criticalPostAcceptSyncOk',
       );
       _logRideReq(
         '[MATCH_DEBUG][DRIVER_ACTIVE_TRIP] rideId=$rideId driverId=$_effectiveDriverId '
@@ -11047,25 +11182,38 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'rideStatus=$_rideStatus currentRideId=$_currentRideId '
         'driverActive=$_driverActiveRideId trip_state=$committedCanonicalForCommit',
       );
-      _applyRideLocationsFromData(validatedCommittedRideData);
-      _evaluateArrivedAvailability();
-      _loggedDriverChatMessageIds.clear();
-      _startDriverChatListener(rideId);
+      try {
+        _applyRideLocationsFromData(validatedCommittedRideData);
+        _evaluateArrivedAvailability();
+        _loggedDriverChatMessageIds.clear();
+        _startDriverChatListener(rideId);
+        unawaited(
+          _loadRiderDetails(
+            rideId: rideId,
+            rideData: validatedCommittedRideData,
+          ),
+        );
+        await _listenToActiveRide(rideId);
+        _scheduleActiveRouteRefresh(
+          force: true,
+          reason: 'driver_accept_local',
+          debounce: Duration.zero,
+        );
+        _refreshIosDriverMapIfNeeded(reason: 'driver_accept_local');
+      } catch (error, stackTrace) {
+        _logRideReq(
+          '[MATCH_DEBUG][ACCEPT_UI_SOFT_FAIL] rideId=$rideId error=$error',
+        );
+        _log('accept post_bind_soft_failure rideId=$rideId error=$error');
+        debugPrintStack(
+          label: 'accept post_bind',
+          stackTrace: stackTrace,
+        );
+      }
+
       unawaited(
-        _loadRiderDetails(
-          rideId: rideId,
-          rideData: validatedCommittedRideData,
-        ),
-      );
-      await _listenToActiveRide(rideId);
-      _scheduleActiveRouteRefresh(
-        force: true,
-        reason: 'driver_accept_local',
-        debounce: Duration.zero,
-      );
-      _refreshIosDriverMapIfNeeded(reason: 'driver_accept_local');
-      unawaited(
-        _driverTripSafetyService.logRideStateChange(
+        _driverTripSafetyService
+            .logRideStateChange(
           rideId: rideId,
           riderId: _valueAsText(validatedCommittedRideData['rider_id']),
           driverId: _effectiveDriverId,
@@ -11074,7 +11222,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           status: committedStatus,
           source: 'driver_accept',
           rideData: validatedCommittedRideData,
-        ),
+        )
+            .catchError((Object error) {
+          _log(
+            'accept telemetry soft_failure rideId=$rideId error=$error',
+          );
+        }),
       );
 
       _logRtdb(
@@ -11090,6 +11243,15 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _printRideOwnershipDebug(validatedCommittedRideData);
       _log('[LAST_ACTIVE] updated source=accept_ride rideId=$rideId');
       acceptSucceeded = true;
+      if (!criticalPostAcceptSyncOk) {
+        _showSnackBarSafely(
+          const SnackBar(
+            content: Text(
+              'Ride accepted. If the trip panel looks wrong, pull to refresh.',
+            ),
+          ),
+        );
+      }
       if (_acceptingPopupRideId == rideId) {
         _acceptingPopupRideId = null;
       }
@@ -11098,6 +11260,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       if (_currentRideId != rideId) {
         _driverActiveRideId = null;
       }
+      _logRideReq(
+        '[MATCH_DEBUG][ACCEPT_FAIL] rideId=$rideId reason=exception '
+        'type=${error.runtimeType} phase=accept_try',
+      );
       _logRideReq(
         '[MATCH_DEBUG][ACCEPT_TX_ABORT] rideId=$rideId reason=exception '
         'type=${error.runtimeType}',
