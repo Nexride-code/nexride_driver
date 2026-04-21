@@ -260,6 +260,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   final Set<String> _presentedRideIds = <String>{};
   final Set<String> _timedOutRideIds = <String>{};
   final Set<String> _declinedRideIds = <String>{};
+  final Set<String> _handledRideIds = <String>{};
   /// Ride IDs that must never re-open the market discovery popup (accept/decline).
   final Set<String> _suppressedRidePopupIds = <String>{};
   /// Accepted (or otherwise completed-on-this-device) ride IDs — never unsuppress, never popup again this session.
@@ -1588,6 +1589,21 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _log('[RIDE_REQ] $message');
   }
 
+  void _logCanonicalRideEvent({
+    required String eventName,
+    required String rideId,
+    Map<String, dynamic>? rideData,
+  }) {
+    final status = rideData == null ? '' : _valueAsText(rideData['status']);
+    final tripState =
+        rideData == null ? '' : _valueAsText(rideData['trip_state']);
+    final driverId = rideData == null ? '' : _valueAsText(rideData['driver_id']);
+    _logRideReq(
+      '[MATCH_EVENT] event=$eventName rideId=$rideId status=$status '
+      'trip_state=$tripState driver_id=$driverId',
+    );
+  }
+
   /// Temporary verification for RTDB discovery vs rider writes (filter by `[DRIVER_REQ]`).
   void _logDriverReq(String message) {
     debugPrint('[DRIVER_REQ] $message');
@@ -2521,6 +2537,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _presentedRideIds.clear();
     _timedOutRideIds.clear();
     _declinedRideIds.clear();
+    _handledRideIds.clear();
     _suppressedRidePopupIds.clear();
     _terminalSelfAcceptedRideIds.clear();
     _onlineSessionStartedAt = 0;
@@ -5596,6 +5613,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _log(
       'system cancel applied rideId=$rideId reason=$reason source=$transitionSource effectiveAt=${effectiveAt ?? 0}',
     );
+    _logCanonicalRideEvent(
+      eventName: reason == 'driver_start_timeout' || reason == 'no_route_logs'
+          ? 'ride_expired'
+          : 'ride_cancelled',
+      rideId: rideId,
+      rideData: committedRide,
+    );
     return true;
   }
 
@@ -5869,6 +5893,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
   String? _popupLocalSkipReason(String rideId) {
     final normalizedId = rideId.trim();
+    if (_handledRideIds.contains(normalizedId)) {
+      return 'already_handled';
+    }
     if (_terminalSelfAcceptedRideIds.contains(normalizedId)) {
       _logRideReq(
         '[MATCH_DEBUG][POPUP_SUPPRESSED_SELF_ACCEPTED] rideId=$normalizedId '
@@ -5904,6 +5931,35 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     return null;
+  }
+
+  bool _isCanonicalOpenForClaim(String canonicalState) {
+    return canonicalState == TripLifecycleState.searchingDriver ||
+        canonicalState == TripLifecycleState.requested;
+  }
+
+  bool _isRideClaimableForDriverAccept(Map<String, dynamic> rideData) {
+    final canonicalState = TripStateMachine.canonicalStateFromSnapshot(rideData);
+    if (!_isCanonicalOpenForClaim(canonicalState)) {
+      return false;
+    }
+
+    final status = _normalizedRideStatus(_valueAsText(rideData['status']));
+    if (status == 'accepted' ||
+        status == 'cancelled' ||
+        status == 'expired' ||
+        status == 'completed') {
+      return false;
+    }
+
+    final expiresAt = _rideExpiryTimestamp(rideData);
+    if (expiresAt > 0 &&
+        DateTime.now().millisecondsSinceEpoch >= expiresAt) {
+      return false;
+    }
+
+    final assignedDriver = _valueAsText(rideData['driver_id']);
+    return assignedDriver.isEmpty || assignedDriver.toLowerCase() == 'waiting';
   }
 
   void _logRideRequestDiscoveryRecheckSuppressed(
@@ -7262,31 +7318,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               rideId: rideId,
               rideData: rideData,
             );
-            if ((_activePopupRideId != rideId || !_popupOpen) &&
-                !_hasActivePopup) {
-              if (_foreverSuppressedRidePopupIds.contains(rideId.trim())) {
-                _logRideReq(
-                  '[MATCH_DEBUG][POPUP_SUPPRESSED_ACCEPTED] rideId=$rideId '
-                  'source=driver_active_ride_listener_pending',
-                );
-              } else {
-                final matchedRide = _matchRideForPopup(
-                  rideId,
-                  rideData,
-                  ignoreLocalState: true,
-                  logSkips: false,
-                );
-                if (matchedRide != null) {
-                  _logReqDebug('popup OPEN rideId=${matchedRide.rideId}');
-                  unawaited(
-                    showRideRequestPopup(
-                      matchedRide,
-                      rideAlreadyReserved: true,
-                    ),
-                  );
-                }
-              }
-            }
+            _logRideReq(
+              '[MATCH_DEBUG][POPUP_SUPPRESSED_PENDING_STATE] rideId=$rideId '
+              'source=driver_active_ride_listener_pending',
+            );
             return;
           }
 
@@ -7379,6 +7414,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _presentedRideIds.clear();
     _timedOutRideIds.clear();
     _declinedRideIds.clear();
+    _handledRideIds.clear();
     _suppressedRidePopupIds.clear();
     _onlineSessionStartedAt = 0;
 
@@ -7497,38 +7533,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               rideId: rideId,
               rideData: rideData,
             );
-            if ((_activePopupRideId != rideId || !_popupOpen) &&
-                !_hasActivePopup) {
-              if (_foreverSuppressedRidePopupIds.contains(rideId.trim()) ||
-                  _terminalSelfAcceptedRideIds.contains(rideId.trim())) {
-                _logRideReq(
-                  '[MATCH_DEBUG][POPUP_SUPPRESSED_ACCEPTED] rideId=$rideId '
-                  'source=active_ride_child_listener_pending',
-                );
-                if (_terminalSelfAcceptedRideIds.contains(rideId.trim())) {
-                  _logRideReq(
-                    '[MATCH_DEBUG][POPUP_SUPPRESSED_SELF_ACCEPTED] rideId=$rideId '
-                    'source=active_ride_child_listener_pending_terminal',
-                  );
-                }
-              } else {
-                final matchedRide = _matchRideForPopup(
-                  rideId,
-                  rideData,
-                  ignoreLocalState: true,
-                  logSkips: false,
-                );
-                if (matchedRide != null) {
-                  _logReqDebug('popup OPEN rideId=${matchedRide.rideId}');
-                  unawaited(
-                    showRideRequestPopup(
-                      matchedRide,
-                      rideAlreadyReserved: true,
-                    ),
-                  );
-                }
-              }
-            }
+            _logRideReq(
+              '[MATCH_DEBUG][POPUP_SUPPRESSED_PENDING_STATE] rideId=$rideId '
+              'source=active_ride_child_listener_pending',
+            );
             return;
           }
 
@@ -8701,6 +8709,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _presentedRideIds.clear();
     _timedOutRideIds.clear();
     _declinedRideIds.clear();
+    _handledRideIds.clear();
     _suppressedRidePopupIds.clear();
     _foreverSuppressedRidePopupIds.clear();
     _terminalSelfAcceptedRideIds.clear();
@@ -9666,6 +9675,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _logRideReq(
           'popup opening rideId=${recheckedRide.rideId} source=$source (calling showRideRequestPopup)',
         );
+        _logCanonicalRideEvent(
+          eventName: 'ride_offered',
+          rideId: recheckedRide.rideId,
+          rideData: recheckedRide.rideData,
+        );
         _logReqDebug('popup OPEN rideId=${recheckedRide.rideId}');
         _logPopupFix('opening popup rideId=${recheckedRide.rideId}');
         _logPopup('opening rideId=${recheckedRide.rideId}');
@@ -10067,7 +10081,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     var popupTimedOut = false;
     var remainingSeconds = _kRidePopupCountdownSeconds;
     var isAccepting = false;
-    var rideReserved = rideAlreadyReserved;
+      var rideReserved = rideAlreadyReserved;
     var rideAccepted = false;
     StateSetter? dialogSetState;
 
@@ -10215,26 +10229,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         return;
       }
 
-      if (!rideReserved) {
-        final reservedRide = await _reserveRideForPopup(
-          ride: popupRide,
-          driverName: driverName,
-          car: car,
-          plate: plate,
-        );
-        if (reservedRide == null) {
-          _logRideReq(
-            'popup blocked reason=reserve_failed rideId=${popupRide.rideId}',
-          );
-          _clearRidePreview();
-          _rearmRideRequestListener(
-            'assignment blocked rideId=${popupRide.rideId}',
-          );
-          return;
-        }
-        rideReserved = true;
-        popupRide = reservedRide;
-      }
+      // Hard reset behavior: keep `ride_requests/{rideId}` open until an atomic
+      // accept transaction commits. Do not pre-reserve via pending state.
+      rideReserved = false;
 
       final refreshedPopupRide = await _loadLivePopupRide(
         popupRide.rideId,
@@ -10301,6 +10298,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
       _logRtdb(
         'popup shown rideId=${activePopupRide.rideId} countdown=$_kRidePopupCountdownSeconds',
+      );
+      _logCanonicalRideEvent(
+        eventName: 'popup_shown',
+        rideId: activePopupRide.rideId,
+        rideData: activePopupRide.rideData,
       );
       final preShowSnapshot = await _rideRequestChildGetIosSafe(
         activePopupRide.rideId,
@@ -10692,6 +10694,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
                                 '[MATCH_DEBUG][ACCEPT_TAP] rideId=${activePopupRide.rideId} '
                                 'driverId=$_effectiveDriverId ts=$acceptRequestedAt',
                               );
+                              _logCanonicalRideEvent(
+                                eventName: 'accept_pressed',
+                                rideId: activePopupRide.rideId,
+                                rideData: activePopupRide.rideData,
+                              );
                               _logRtdb(
                                 'accept tapped rideId=${activePopupRide.rideId} driverId=$_effectiveDriverId',
                               );
@@ -10760,6 +10767,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       if (action == _RidePopupAction.declined) {
         _popupDismissedReason = 'driver_declined';
         _declinedRideIds.add(popupRide.rideId.trim());
+        _handledRideIds.add(popupRide.rideId.trim());
         _suppressedRidePopupIds.add(popupRide.rideId.trim());
         _logRtdb('popup declined locally rideId=${popupRide.rideId}');
         _log(
@@ -10772,11 +10780,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
       if (action == _RidePopupAction.accepted) {
         rideAccepted = true;
+        _handledRideIds.add(popupRide.rideId.trim());
         return;
       }
 
       if (action == _RidePopupAction.blocked) {
         final blockedRid = popupRide.rideId.trim();
+        _handledRideIds.add(blockedRid);
         if (_terminalSelfAcceptedRideIds.contains(blockedRid) ||
             _foreverSuppressedRidePopupIds.contains(blockedRid)) {
           _logRideReq(
@@ -10802,6 +10812,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
       _presentedRideIds.remove(popupRide.rideId.trim());
       if (popupTimedOut) {
+        _handledRideIds.add(popupRide.rideId.trim());
         _clearRidePreview();
         _rearmRideRequestListener('popup timeout rideId=${popupRide.rideId}');
         return;
@@ -10942,8 +10953,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     try {
       String blockedReason = 'unknown';
       var acceptLockWasIdempotent = false;
-      final startTimeoutAt = DateTime.now().millisecondsSinceEpoch +
-          TripStateMachine.acceptedToStartTimeout.inMilliseconds;
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final startTimeoutAt =
+          nowMs + TripStateMachine.acceptedToStartTimeout.inMilliseconds;
       _logRideReq(
         '[MATCH_DEBUG][ACCEPT_START] rideId=$rideId driverId=$_effectiveDriverId',
       );
@@ -10958,31 +10970,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         }
 
         final currentCanonicalState =
-            TripStateMachine.canonicalStateFromSnapshot(
-          current,
-        );
+            TripStateMachine.canonicalStateFromSnapshot(current);
         final currentDriverId = _valueAsText(current['driver_id']);
         if (currentDriverId == _effectiveDriverId &&
             TripStateMachine.isDriverActiveState(currentCanonicalState)) {
           acceptLockWasIdempotent = true;
           return rtdb.Transaction.success(Map<String, dynamic>.from(current));
         }
-        if (!TripStateMachine.isPendingDriverAssignmentState(
-              currentCanonicalState,
-            ) ||
-            currentDriverId != _effectiveDriverId) {
+        if (!_isRideClaimableForDriverAccept(current)) {
           blockedReason = _popupServerSkipReason(rideId, current) ??
-              'ride_not_reserved_for_driver';
-          return rtdb.Transaction.abort();
-        }
-
-        final assignmentExpiresAt = _assignmentExpiryTimestamp(current);
-        if (_assignmentHasExpired(current) &&
-            !wasPendingAcceptanceStartedBeforeExpiry(
-              acceptRequestedAt: effectiveAcceptRequestedAt,
-              assignmentExpiresAt: assignmentExpiresAt,
-            )) {
-          blockedReason = 'assignment_expired';
+              'ride_not_claimable';
           return rtdb.Transaction.abort();
         }
 
@@ -11007,6 +11004,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               'driver_match_confirmed_at': rtdb.ServerValue.timestamp,
               // Leave the open-market index; [service_area]/[city] still carry market.
               'market': null,
+              'status': 'accepted',
+              'trip_state': 'accepted',
+              'accepted_at': rtdb.ServerValue.timestamp,
               'assignment_expires_at': null,
               'driver_response_timeout_at': null,
               'assignment_timeout_ms': null,
@@ -11070,6 +11070,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _logRideReq(
           '[MATCH_DEBUG][ACCEPT_FAIL] rideId=$rideId reason=$latestBlockedReason '
           'phase=transaction',
+        );
+        _logCanonicalRideEvent(
+          eventName: 'transaction_failed',
+          rideId: rideId,
+          rideData: latestRideData,
         );
         if (_rideBelongsToAnotherDriver(latestRideData)) {
           _logRtdb('accept lost rideId=$rideId');
@@ -11147,6 +11152,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         '[MATCH_DEBUG][ACCEPT_TX_COMMIT] rideId=$rideId driverId=$_effectiveDriverId '
         'idempotent=$acceptLockWasIdempotent rtdb_committed=${transactionResult.committed} '
         'trip_state=$committedCanonicalForCommit ui_status=$committedStatus',
+      );
+      _logCanonicalRideEvent(
+        eventName: 'transaction_committed',
+        rideId: rideId,
+        rideData: validatedCommittedRideData,
       );
 
       final rid = rideId.trim();
