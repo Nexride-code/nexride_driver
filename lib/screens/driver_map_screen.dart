@@ -379,6 +379,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   bool _deliveryProofUploading = false;
   bool _routeRequestInFlight = false;
   bool _isDisposing = false;
+  bool _rideDiscoveryListenerHealthy = false;
   String? _activePopupRideId;
   String? _acceptingPopupRideId;
   String? _popupDismissedRideId;
@@ -407,6 +408,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   double _riderRating = 5.0;
   int _routeRequestGeneration = 0;
   _PendingRouteRequest? _pendingRouteRequest;
+  Timer? _rideDiscoveryReattachTimer;
 
   Color get _gold => const Color(0xFFD4AF37);
   LatLng get _nigeriaMarketCenter => const LatLng(
@@ -1589,6 +1591,47 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _log('[RIDE_REQ] $message');
   }
 
+  String _firebaseErrorCode(Object error) {
+    if (error is FirebaseException) {
+      return error.code.trim().isEmpty ? 'unknown' : error.code;
+    }
+    return 'unknown';
+  }
+
+  String _firebaseErrorMessage(Object error) {
+    if (error is FirebaseException) {
+      return (error.message ?? error.toString()).trim();
+    }
+    return error.toString();
+  }
+
+  String _discoveryListenerFailureMessage(Object error) {
+    final code = _firebaseErrorCode(error).toLowerCase();
+    if (isRealtimeDatabasePermissionDenied(error) || code == 'permission-denied') {
+      return 'Ride listings are blocked by Realtime Database permissions. Verify rules for ride discovery query access.';
+    }
+    if (code.contains('network') || code.contains('unavailable')) {
+      return 'Ride listings connection was interrupted. Retrying automatically...';
+    }
+    if (code.contains('database') || code.contains('project')) {
+      return 'Ride listings configuration mismatch detected (project/database URL). Verify both rider and driver use the same Firebase app.';
+    }
+    return 'Ride listings listener failed to attach. Retrying automatically...';
+  }
+
+  void _scheduleRideDiscoveryReattach({
+    required String reason,
+    Duration delay = const Duration(seconds: 2),
+  }) {
+    _rideDiscoveryReattachTimer?.cancel();
+    _rideDiscoveryReattachTimer = Timer(delay, () {
+      if (!mounted || !_isOnline || _isDisposing) {
+        return;
+      }
+      unawaited(_listenForRideRequests(reason: reason));
+    });
+  }
+
   void _logCanonicalRideEvent({
     required String eventName,
     required String rideId,
@@ -1994,6 +2037,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _positionStream?.cancel();
     _rideRequestListenerToken += 1;
     _rideRequestSubscription?.cancel();
+    _rideDiscoveryReattachTimer?.cancel();
     _rideRequestsListenerBoundCity = null;
     _driverActiveRideSubscription?.cancel();
     _activeRideSubscription?.cancel();
@@ -7379,6 +7423,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
     final subscription = _rideRequestSubscription;
     _rideRequestSubscription = null;
+    _rideDiscoveryListenerHealthy = false;
     _rideRequestsListenerBoundCity = null;
     await subscription?.cancel();
     if (hadListener) {
@@ -8584,13 +8629,15 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _logPopup(
           'goOnline presence published but ride request listener did not attach',
         );
-        _showSnackBarSafely(
-          const SnackBar(
-            content: Text(
-              'You are online, but ride request alerts could not start (check market / connection). Try GO ONLINE again.',
-            ),
-          ),
+        await _rollbackFailedGoOnline(
+          driverId: driverId,
+          reason: 'discovery_listener_not_ready',
+          publishedPresence: true,
         );
+        _showAvailabilityFailureNotice(
+          'Driver is set offline because ride discovery failed to start. Check Firebase project/database and try GO ONLINE again.',
+        );
+        return;
       }
 
       final reconcile = profileReconcileFuture;
@@ -9311,7 +9358,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
                     ) ??
                   '';
           final qualifies = rideData != null &&
-              _serviceTypeKey(rideData['service_type']) == 'ride' &&
+              DriverFeatureFlags.activeRequestServiceTypes.contains(
+                _serviceTypeKey(rideData['service_type']),
+              ) &&
               skipReason.isEmpty;
           _logRideReq(
             'ride discovery evaluation rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason} source=$source',
@@ -9807,6 +9856,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
       _rideRequestSubscription = rideRequestsQuery.onValue.listen(
         (event) async {
+          _rideDiscoveryListenerHealthy = true;
           try {
             await queueSnapshotProcessing(
               event.snapshot,
@@ -9821,16 +9871,21 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         onError: (Object error) {
           final uid = FirebaseAuth.instance.currentUser?.uid ?? 'none';
           final denied = isRealtimeDatabasePermissionDenied(error);
+          final code = _firebaseErrorCode(error);
+          final message = _firebaseErrorMessage(error);
+          _rideDiscoveryListenerHealthy = false;
           debugPrint(
             '[RTDB_DISCOVERY] STREAM_ERROR path=ride_requests?orderByChild=market&equalTo=$driverCity '
-            'market=$driverCity authUid=$uid permissionDenied=$denied error=$error',
+            'market=$driverCity authUid=$uid permissionDenied=$denied code=$code error=$message',
           );
           rtdbFlowLog(
             '[DRIVER_LISTENER_FAIL]',
             'uid=$uid market=$driverCity op=onValue_stream denied=$denied error=$error',
           );
-          _log('ride listener error=$error');
-          _logRideReq('request listener stream ERROR market=$driverCity error=$error');
+          _log('ride listener error code=$code message=$message');
+          _logRideReq(
+            'request listener stream ERROR market=$driverCity code=$code message=$message',
+          );
           if (isRealtimeDatabasePermissionDenied(error)) {
             _logDriverReq('skippedReason=rtdb_permission_denied_stream error=$error');
             unawaited(
@@ -9843,9 +9898,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             );
             _showSnackBarSafely(
               SnackBar(
-                content: const Text(
-                  'Unable to connect to ride listings. Check your connection, then tap Retry or go online again.',
-                ),
+                content: Text(_discoveryListenerFailureMessage(error)),
                 action: SnackBarAction(
                   label: 'Retry',
                   onPressed: () {
@@ -9858,12 +9911,44 @@ class _DriverMapScreenState extends State<DriverMapScreen>
                 ),
               ),
             );
+          } else {
+            _showSnackBarSafely(
+              SnackBar(
+                content: Text(_discoveryListenerFailureMessage(error)),
+                action: SnackBarAction(
+                  label: 'Retry now',
+                  onPressed: () {
+                    unawaited(
+                      _listenForRideRequests(
+                        reason: 'snackbar_retry_after_stream_error',
+                      ),
+                    );
+                  },
+                ),
+              ),
+            );
+          }
+          _scheduleRideDiscoveryReattach(
+            reason: 'stream_error_auto_retry_$code',
+          );
+          if (_currentRideId == null && _driverActiveRideId == null) {
+            unawaited(
+              _rollbackFailedGoOnline(
+                driverId: _effectiveDriverId,
+                reason: 'discovery_stream_error_$code',
+                publishedPresence: true,
+              ),
+            );
           }
         },
       );
       _logRideReq(
         '[MATCH_DEBUG][DRIVER_ATTACH] market=$driverCity token=$listenerToken '
         'reason=$reason prime_get=skipped_ios_safe',
+      );
+      _rideDiscoveryListenerHealthy = true;
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_LISTENER_ATTACH_OK] market=$driverCity token=$listenerToken',
       );
       _logRtdb(
         'listener prime skipped (onValue initial snapshot only) city=$driverCity',
@@ -9877,20 +9962,24 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logDiscoveryChain('online attach success market=$driverCity reason=$reason');
       return true;
     } catch (error) {
+      final code = _firebaseErrorCode(error);
+      final message = _firebaseErrorMessage(error);
       _rideRequestsListenerBoundCity = null;
+      _rideDiscoveryListenerHealthy = false;
       _logReqDebug('listener attach FAIL error=$error');
       _logDriverReq(
-        'skippedReason=listener_attach_failed market=$driverCity reason=$reason error=$error',
+        'skippedReason=listener_attach_failed market=$driverCity reason=$reason code=$code message=$message',
       );
       _log(
-          'ride listener attach failed city=$driverCity reason=$reason error=$error');
+          'ride listener attach failed city=$driverCity reason=$reason code=$code message=$message');
       _logRideReq(
         'request listener ATTACH FAILED market=$driverCity reason=$reason error=$error',
       );
       _logPopup('listener attach FAILED error=$error');
       _logDiscoveryChain('listener attach FAILED error=$error');
-      _showAvailabilityFailureNotice(
-        'Unable to load nearby ride requests. Please check your connection and tap GO ONLINE again.',
+      _showAvailabilityFailureNotice(_discoveryListenerFailureMessage(error));
+      _scheduleRideDiscoveryReattach(
+        reason: 'attach_failure_auto_retry_$code',
       );
       return false;
     }
