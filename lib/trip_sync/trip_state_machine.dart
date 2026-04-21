@@ -121,7 +121,13 @@ class TripStateMachine {
       'pending_driver_action' ||
       'driver_reviewing_request' =>
         TripLifecycleState.pendingDriverAction,
-      'accepted' || 'driver_accepted' => TripLifecycleState.driverAccepted,
+      'accepted' ||
+      'driver_accepted' ||
+      // Rider / legacy apps often use these once a driver is locked in.
+      'driver_found' ||
+      'driver_matched' ||
+      'driver_found_pending' =>
+        TripLifecycleState.driverAccepted,
       'arriving' ||
       'driver_arriving' ||
       'driver_on_the_way' =>
@@ -378,21 +384,61 @@ class TripStateMachine {
     return 'transition_${fromState}_to_${toCanonicalState}_not_allowed';
   }
 
+  static int? _intFromRideData(
+    Map<String, dynamic> rideData,
+    List<String> keys,
+  ) {
+    for (final key in keys) {
+      final v = _asInt(rideData[key]);
+      if (v != null && v > 0) {
+        return v;
+      }
+    }
+    return null;
+  }
+
   static String? lifecycleProofReason(
     Map<String, dynamic> rideData, {
     String? canonicalState,
   }) {
     final state = canonicalState ?? canonicalStateFromSnapshot(rideData);
-    final requestedAt = _asInt(rideData['requested_at']);
-    final searchStartedAt = _asInt(rideData['search_started_at']);
-    final assignedAt = _asInt(rideData['assigned_at']);
-    final acceptedAt = _asInt(rideData['accepted_at']);
-    final arrivingAt = _asInt(rideData['arriving_at']);
-    final arrivedAt = _asInt(rideData['arrived_at']);
-    final startedAt =
-        _asInt(rideData['started_at']) ?? _asInt(rideData['pickupConfirmedAt']);
-    final completedAt = _asInt(rideData['completed_at']);
-    final cancelledAt = _asInt(rideData['cancelled_at']);
+    final requestedAt = _intFromRideData(rideData, [
+      'requested_at',
+      'requestedAt',
+    ]);
+    final searchStartedAt = _intFromRideData(rideData, [
+      'search_started_at',
+      'searchStartedAt',
+    ]);
+    final assignedAt = _intFromRideData(rideData, [
+      'assigned_at',
+      'assignedAt',
+    ]);
+    final acceptedAt = _intFromRideData(rideData, [
+      'accepted_at',
+      'acceptedAt',
+    ]);
+    final arrivingAt = _intFromRideData(rideData, [
+      'arriving_at',
+      'arrivingAt',
+    ]);
+    final arrivedAt =
+        _intFromRideData(rideData, ['arrived_at', 'arrivedAt']);
+    final startedAt = _intFromRideData(rideData, [
+          'started_at',
+          'startedAt',
+        ]) ??
+        _asInt(rideData['pickupConfirmedAt']);
+    final completedAt = _intFromRideData(rideData, [
+      'completed_at',
+      'completedAt',
+    ]);
+    final cancelledAt = _intFromRideData(rideData, [
+      'cancelled_at',
+      'cancelledAt',
+      'canceled_at',
+      'canceledAt',
+    ]);
 
     if (state == TripLifecycleState.requested && requestedAt == null) {
       return 'missing_requested_at';

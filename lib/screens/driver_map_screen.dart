@@ -5687,6 +5687,39 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _latLngFromMap(rideData['final_destination']);
   }
 
+  /// RTDB [onValue] can deliver **partial** maps (e.g. only status/trip_state).
+  /// Merging with the last full snapshot avoids falsely clearing an active trip,
+  /// which used to drop route/chat UI and confuse rider matching.
+  Map<String, dynamic> _coalesceRideListenerSnapshot({
+    required String rideId,
+    required Map<String, dynamic> incoming,
+  }) {
+    final baseline =
+        _currentRideId == rideId ? _currentRideData : null;
+    if (baseline == null || baseline.isEmpty) {
+      return Map<String, dynamic>.from(incoming);
+    }
+
+    final merged = Map<String, dynamic>.from(baseline);
+    incoming.forEach((String key, dynamic value) {
+      if (value == null) {
+        return;
+      }
+      merged[key] = value;
+    });
+
+    for (final key in <String>['pickup', 'destination', 'final_destination']) {
+      if (_latLngFromMap(merged[key]) == null) {
+        final fallback = baseline[key];
+        if (_latLngFromMap(fallback) != null) {
+          merged[key] = fallback;
+        }
+      }
+    }
+
+    return merged;
+  }
+
   String _destinationAddressFromRideData(Map<String, dynamic> rideData) {
     final destinationAddress = _valueAsText(rideData['destination_address']);
     if (destinationAddress.isNotEmpty) {
@@ -7212,8 +7245,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             return;
           }
 
-          final rideData = _asStringDynamicMap(event.snapshot.value);
-          if (rideData == null) {
+          final rawRideData = _asStringDynamicMap(event.snapshot.value);
+          if (rawRideData == null) {
             _logInvalidRideBlocked(rideId: rideId, reason: 'ride_missing');
             await _clearDriverActiveRideNode(
               rideId: rideId,
@@ -7225,6 +7258,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             );
             return;
           }
+
+          final rideData = _coalesceRideListenerSnapshot(
+            rideId: rideId,
+            incoming: rawRideData,
+          );
 
           final assignedDriverId = _valueAsText(rideData['driver_id']);
           if (assignedDriverId != _effectiveDriverId) {
@@ -10621,6 +10659,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               'driver_name': resolvedDriverName,
               'car': resolvedCar,
               'plate': resolvedPlate,
+              // Rider / legacy UIs (and Firestore-era clients) often key off this phrase.
+              'rider_sync_status': 'driver_found',
+              'driver_match_confirmed_at': rtdb.ServerValue.timestamp,
               // Leave the open-market index; [service_area]/[city] still carry market.
               'market': null,
               'assignment_expires_at': null,
@@ -10758,16 +10799,22 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'trip_state=$committedCanonicalForCommit',
       );
 
+      final driverPresence = _buildDriverPresenceUpdate(
+        status: committedStatus,
+        activeRideId: rideId,
+        isAvailable: false,
+      );
+      driverPresence['latest_trip_ride_id'] = rideId;
+      driverPresence['latest_trip_status'] = committedStatus;
+      driverPresence['latest_trip_trip_state'] = committedCanonicalForCommit;
+      driverPresence['latest_trip_at'] = rtdb.ServerValue.timestamp;
+
       await _commitRideAndDriverState(
         rideId: rideId,
         rideUpdates: <String, dynamic>{
           'driver_state_synced_at': rtdb.ServerValue.timestamp,
         },
-        driverUpdates: _buildDriverPresenceUpdate(
-          status: committedStatus,
-          activeRideId: rideId,
-          isAvailable: false,
-        ),
+        driverUpdates: driverPresence,
         activeRideUpdates: <String, Object?>{
           'ride_id': rideId,
           'status': committedStatus,
@@ -10859,6 +10906,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _printRideOwnershipDebug(validatedCommittedRideData);
       _log('[LAST_ACTIVE] updated source=accept_ride rideId=$rideId');
       acceptSucceeded = true;
+      if (_acceptingPopupRideId == rideId) {
+        _acceptingPopupRideId = null;
+      }
       return true;
     } catch (error) {
       if (_currentRideId != rideId) {
@@ -11432,13 +11482,20 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       rideUpdates['dispatch_details/deliveryProofStatus'] = 'submitted';
     }
 
+    final completedDriverPresence = _buildDriverPresenceUpdate(
+      status: 'idle',
+      isAvailable: true,
+    );
+    completedDriverPresence['latest_trip_ride_id'] = currentRideId;
+    completedDriverPresence['latest_trip_status'] = 'completed';
+    completedDriverPresence['latest_trip_trip_state'] =
+        TripLifecycleState.tripCompleted;
+    completedDriverPresence['latest_trip_at'] = rtdb.ServerValue.timestamp;
+
     await _commitRideAndDriverState(
       rideId: currentRideId,
       rideUpdates: rideUpdates,
-      driverUpdates: _buildDriverPresenceUpdate(
-        status: 'idle',
-        isAvailable: true,
-      ),
+      driverUpdates: completedDriverPresence,
       clearActiveRide: true,
     );
     await _endCallForRideLifecycle(rideId: currentRideId);

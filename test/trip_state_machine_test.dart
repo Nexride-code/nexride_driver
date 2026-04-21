@@ -163,4 +163,30 @@ void main() {
     expect(acceptUpdate['accepted_at'], acceptedAt);
     expect(acceptUpdate.containsKey('assigned_at'), isFalse);
   });
+
+  test('legacy driver_found status maps to driver accepted', () {
+    expect(
+      TripStateMachine.canonicalStateFromValues(status: 'driver_found'),
+      TripLifecycleState.driverAccepted,
+    );
+    expect(
+      TripStateMachine.uiStatusFromSnapshot(<String, dynamic>{
+        'status': 'driver_found',
+        'driver_id': 'd1',
+      }),
+      'accepted',
+    );
+  });
+
+  test('lifecycle proof accepts camelCase acceptedAt', () {
+    expect(
+      TripStateMachine.lifecycleProofReason(
+        <String, dynamic>{
+          'trip_state': TripLifecycleState.driverAccepted,
+          'acceptedAt': 1700000000000,
+        },
+      ),
+      isNull,
+    );
+  });
 }

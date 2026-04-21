@@ -587,6 +587,13 @@ class DriverFinanceService {
     }
 
     final requestRef = _rootRef.child('withdraw_requests').push();
+    final withdrawalAccount = payoutDestination.isConfigured
+        ? <String, dynamic>{
+            'bankName': payoutDestination.bankName,
+            'accountName': payoutDestination.accountName,
+            'accountNumber': payoutDestination.accountNumber,
+          }
+        : null;
     await requestRef.set(<String, dynamic>{
       'withdrawalId': requestRef.key,
       'driver_id': normalizedDriverId,
@@ -596,12 +603,11 @@ class DriverFinanceService {
       'requestedAt': rtdb.ServerValue.timestamp,
       'createdAt': rtdb.ServerValue.timestamp,
       'updatedAt': rtdb.ServerValue.timestamp,
-      if (payoutDestination.isConfigured)
-        'destination': <String, dynamic>{
-          'bankName': payoutDestination.bankName,
-          'accountName': payoutDestination.accountName,
-          'accountNumber': payoutDestination.accountNumber,
-        },
+      if (withdrawalAccount != null) ...<String, dynamic>{
+        'destination': withdrawalAccount,
+        // Admin / ops readers expect this shape on withdrawal rows.
+        'withdrawalAccount': withdrawalAccount,
+      },
     });
   }
 
