@@ -116,7 +116,13 @@ class TripStateMachine {
     return switch (normalizedStatus) {
       '' || 'idle' => TripLifecycleState.requested,
       'requested' => TripLifecycleState.requested,
-      'searching' || 'searching_driver' => TripLifecycleState.searchingDriver,
+      'searching' ||
+      'searching_driver' ||
+      // Rider “matching” UI and newer lifecycle labels map to open search pool.
+      'matching' ||
+      'offered' ||
+      'offer_pending' =>
+        TripLifecycleState.searchingDriver,
       'assigned' ||
       'driver_assigned' ||
       'matched' ||

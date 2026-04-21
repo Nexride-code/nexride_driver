@@ -1608,15 +1608,17 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   String _discoveryListenerFailureMessage(Object error) {
     final code = _firebaseErrorCode(error).toLowerCase();
     if (isRealtimeDatabasePermissionDenied(error) || code == 'permission-denied') {
-      return 'Ride listings are blocked by Realtime Database permissions. Verify rules for ride discovery query access.';
+      return 'We could not load nearby ride requests (access denied). '
+          'Confirm you are signed in, then try again. If it keeps happening, '
+          'support may need to adjust ride discovery access in the backend.';
     }
     if (code.contains('network') || code.contains('unavailable')) {
-      return 'Ride listings connection was interrupted. Retrying automatically...';
+      return 'Ride listings were interrupted (network). Retrying automatically…';
     }
     if (code.contains('database') || code.contains('project')) {
-      return 'Ride listings configuration mismatch detected (project/database URL). Verify both rider and driver use the same Firebase app.';
+      return 'Ride listings could not start because the app is pointed at the wrong database or project. Check your build configuration and try again.';
     }
-    return 'Ride listings listener failed to attach. Retrying automatically...';
+    return 'Ride listings could not start. Retrying automatically…';
   }
 
   void _scheduleRideDiscoveryReattach({
@@ -6006,6 +6008,52 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     return assignedDriver.isEmpty || assignedDriver.toLowerCase() == 'waiting';
   }
 
+  /// Raw tokens as written under `ride_requests/{rideId}` (snake_case). Must stay
+  /// aligned with `database.rules.json` discovery branch for open-pool reads.
+  static const Set<String> _kOpenDiscoveryRawLifecycle = <String>{
+    'requested',
+    'searching_driver',
+    'pending_driver_acceptance',
+    'pending_driver_action',
+    'searching',
+    'open',
+    'idle',
+    'created',
+    'new',
+    'awaiting_match',
+    'matching',
+    'offered',
+    'offer_pending',
+  };
+
+  String _rawTripLifecycleToken(dynamic value) =>
+      _valueAsText(value).trim().toLowerCase();
+
+  bool _rideHasOpenDiscoveryLifecycle(Map<String, dynamic> rideData) {
+    final statusToken = _rawTripLifecycleToken(rideData['status']);
+    final tripToken = _rawTripLifecycleToken(rideData['trip_state']);
+    if (statusToken.isNotEmpty &&
+        _kOpenDiscoveryRawLifecycle.contains(statusToken)) {
+      return true;
+    }
+    if (tripToken.isNotEmpty && _kOpenDiscoveryRawLifecycle.contains(tripToken)) {
+      return true;
+    }
+    return false;
+  }
+
+  bool _isOpenPoolDiscoveryLifecycle({
+    required String uiStatus,
+    required Map<String, dynamic> rideData,
+    required String canonicalState,
+  }) {
+    return uiStatus == 'searching' ||
+        uiStatus == 'requested' ||
+        _rideHasOpenDiscoveryLifecycle(rideData) ||
+        canonicalState == TripLifecycleState.searchingDriver ||
+        canonicalState == TripLifecycleState.requested;
+  }
+
   void _logRideRequestDiscoveryRecheckSuppressed(
     String rideId,
     Map<String, dynamic>? rideData,
@@ -6031,9 +6079,17 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final ui = rideData == null
         ? ''
         : TripStateMachine.uiStatusFromSnapshot(rideData);
-    if (ui != 'searching' && ui != 'requested') {
+    final canonical = rideData == null
+        ? TripLifecycleState.requested
+        : TripStateMachine.canonicalStateFromSnapshot(rideData);
+    if (!_isOpenPoolDiscoveryLifecycle(
+      uiStatus: ui,
+      rideData: rideData ?? const <String, dynamic>{},
+      canonicalState: canonical,
+    )) {
       _logRtdb(
-        'popup skipped reason=status_not_searching_after_recheck rideId=$n',
+        'popup skipped reason=status_not_open_discovery_after_recheck rideId=$n '
+        'ui=$ui canonical=$canonical',
       );
       return;
     }
@@ -6134,10 +6190,19 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return 'expired';
     }
 
-    // Discovery source-of-truth: rider-created open rides are "searching".
-    if (uiStatus != 'searching') {
+    if (!_isOpenPoolDiscoveryLifecycle(
+      uiStatus: uiStatus,
+      rideData: rideData,
+      canonicalState: canonicalState,
+    )) {
       _logPopupFix('skip reason=status_not_active_open rideId=$rideId');
       _logPopupServerSkip(rideId, rideData, 'status_not_searching');
+      _logRideReq(
+        '[MATCH_DEBUG][DRIVER_FILTER] rideId=$rideId ui=$uiStatus canonical=$canonicalState '
+        'raw_status=${_rawTripLifecycleToken(rideData['status'])} '
+        'raw_trip_state=${_rawTripLifecycleToken(rideData['trip_state'])} '
+        'qualifies=false reason=not_open_discovery_lifecycle',
+      );
       return 'status_not_searching';
     }
 
@@ -9894,7 +9959,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               ),
             );
             _logRtdb(
-              'ride_requests query permission denied — check RTDB rules (drivers node + market query) and deploy database.rules.json',
+              'ride_requests discovery stream permission denied (logged for engineering; '
+              'snackbar shows user-safe copy)',
             );
             _showSnackBarSafely(
               SnackBar(
