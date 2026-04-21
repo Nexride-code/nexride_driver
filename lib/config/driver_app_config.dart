@@ -26,7 +26,8 @@ class DriverAlertSoundConfig {
   static const bool enableRideRequestAlerts = true;
   static const bool enableChatAlerts = true;
   static const bool enableIncomingCallAlerts = true;
-  static const String alertAssetPath = 'sounds/ride_request.mp3';
+  /// Must match a path under `flutter: assets:` in pubspec (includes `assets/` prefix).
+  static const String alertAssetPath = 'assets/sounds/ride_request.mp3';
 }
 
 class DriverLaunchMarket {

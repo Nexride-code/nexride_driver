@@ -1,0 +1,54 @@
+{
+  "rules": {
+    "drivers": {
+      "$driverId": {
+        ".read": "auth != null && auth.uid === $driverId",
+        ".write": "auth != null && auth.uid === $driverId"
+      }
+    },
+    "driver_active_ride": {
+      "$driverId": {
+        ".read": "auth != null && auth.uid === $driverId",
+        ".write": "auth != null && auth.uid === $driverId"
+      }
+    },
+    "ride_requests": {
+      "$rideId": {
+        ".read": "auth != null",
+        ".write": "auth != null && (!data.exists() || data.child('rider_id').val() === auth.uid || data.child('driver_id').val() === auth.uid || data.child('driver_id').val() === 'waiting' || data.child('driver_id').val() === null)"
+      }
+    },
+    "trip_route_logs": {
+      "$rideId": {
+        ".read": "auth != null",
+        ".write": "auth != null && root.child('ride_requests').child($rideId).child('driver_id').val() === auth.uid"
+      }
+    },
+    "trip_settlement_hooks": {
+      "$rideId": {
+        ".read": "auth != null",
+        ".write": "auth != null && root.child('ride_requests').child($rideId).child('driver_id').val() === auth.uid"
+      }
+    },
+    "driver_trips": {
+      "$driverId": {
+        "$rideId": {
+          ".read": "auth != null && auth.uid === $driverId",
+          ".write": "auth != null && auth.uid === $driverId"
+        }
+      }
+    },
+    "driver_earnings": {
+      "$driverId": {
+        ".read": "auth != null && auth.uid === $driverId",
+        ".write": "auth != null && auth.uid === $driverId"
+      }
+    },
+    "shared_trips": {
+      "$token": {
+        ".read": "auth != null",
+        ".write": "auth != null"
+      }
+    }
+  }
+}

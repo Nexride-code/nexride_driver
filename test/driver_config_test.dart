@@ -275,7 +275,7 @@ void main() {
     expect(DriverAlertSoundConfig.enableRideRequestAlerts, isTrue);
     expect(DriverAlertSoundConfig.enableChatAlerts, isTrue);
     expect(DriverAlertSoundConfig.enableIncomingCallAlerts, isTrue);
-    expect(DriverAlertSoundConfig.alertAssetPath, 'sounds/ride_request.mp3');
+    expect(DriverAlertSoundConfig.alertAssetPath, 'assets/sounds/ride_request.mp3');
   });
 
   test('driver launch markets cover the four supported Nigeria states', () {

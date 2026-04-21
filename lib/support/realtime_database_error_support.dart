@@ -52,6 +52,56 @@ Future<T> runRequiredRealtimeDatabaseRead<T>({
   }
 }
 
+/// Best-effort RTDB write (telemetry, secondary indexes). Logs permission-denied
+/// without throwing so trip UX is not torn down by optional paths.
+Future<bool> runOptionalRealtimeDatabaseWrite({
+  required String source,
+  required String path,
+  required String operation,
+  required RealtimeDatabaseAction<void> action,
+  String? rideId,
+}) async {
+  final uid = FirebaseAuth.instance.currentUser?.uid ?? 'unauthenticated';
+  _logRtdbWrite(
+    source: source,
+    path: path,
+    operation: operation,
+    uid: uid,
+    rideId: rideId,
+    phase: 'start',
+    code: 'n/a',
+  );
+  try {
+    await action();
+    _logRtdbWrite(
+      source: source,
+      path: path,
+      operation: operation,
+      uid: uid,
+      rideId: rideId,
+      phase: 'success',
+      code: 'ok',
+    );
+    return true;
+  } catch (error, stackTrace) {
+    final denied = isRealtimeDatabasePermissionDenied(error);
+    final code = error is FirebaseException ? error.code : 'non_firebase';
+    _logRtdbWrite(
+      source: source,
+      path: path,
+      operation: operation,
+      uid: uid,
+      rideId: rideId,
+      phase: 'error',
+      code: code,
+      denied: denied,
+      error: error,
+      stackTrace: stackTrace,
+    );
+    return false;
+  }
+}
+
 Future<T?> runOptionalRealtimeDatabaseRead<T>({
   required String source,
   required String path,
@@ -107,6 +157,31 @@ String realtimeDatabaseDebugMessage(
     return fallback;
   }
   return '$fallback\n[$path] $error';
+}
+
+void _logRtdbWrite({
+  required String source,
+  required String path,
+  required String operation,
+  required String uid,
+  String? rideId,
+  required String phase,
+  required String code,
+  bool denied = false,
+  Object? error,
+  StackTrace? stackTrace,
+}) {
+  debugPrint(
+    '[RTDB_WRITE] phase=$phase source=$source operation=$operation path=$path '
+    'uid=$uid rideId=${rideId ?? 'n/a'} code=$code permissionDenied=$denied'
+    '${error == null ? '' : ' error=$error'}',
+  );
+  if (error != null && stackTrace != null) {
+    debugPrintStack(
+      label: '[RTDB_WRITE] source=$source path=$path',
+      stackTrace: stackTrace,
+    );
+  }
 }
 
 void _logRealtimeDatabaseAccess({

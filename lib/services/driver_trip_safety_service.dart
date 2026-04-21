@@ -25,7 +25,7 @@ class DriverTripSafetyService {
     Map<String, dynamic>? rideData,
   }) async {
     final eventRef = _rootRef.child('trip_route_logs/$rideId/events').push();
-    await _rootRef.update(<String, dynamic>{
+    final payload = <String, dynamic>{
       'trip_route_logs/$rideId/rideId': rideId,
       'trip_route_logs/$rideId/riderId': riderId,
       'trip_route_logs/$rideId/driverId': driverId,
@@ -53,7 +53,15 @@ class DriverTripSafetyService {
       'ride_requests/$rideId/route_log_last_event_status': status,
       'ride_requests/$rideId/route_log_last_event_source': source,
       'ride_requests/$rideId/has_route_logs': true,
-    });
+    };
+
+    await runOptionalRealtimeDatabaseWrite(
+      source: 'trip_safety.logRideStateChange',
+      path: 'trip_route_logs/$rideId+ride_requests/$rideId(route_log)',
+      operation: 'multi_path_update',
+      rideId: rideId,
+      action: () => _rootRef.update(payload),
+    );
 
     await _syncSharedTripStatus(
       rideId: rideId,
@@ -73,7 +81,7 @@ class DriverTripSafetyService {
   }) async {
     final checkpointRef =
         _rootRef.child('trip_route_logs/$rideId/checkpoints').push();
-    await _rootRef.update(<String, dynamic>{
+    final payload = <String, dynamic>{
       'trip_route_logs/$rideId/checkpoints/${checkpointRef.key}':
           <String, dynamic>{
         'checkpointId': checkpointRef.key,
@@ -108,7 +116,15 @@ class DriverTripSafetyService {
             rtdb.ServerValue.timestamp,
       if (status == 'on_trip')
         'ride_requests/$rideId/route_log_timeout_at': null,
-    });
+    };
+
+    await runOptionalRealtimeDatabaseWrite(
+      source: 'trip_safety.logCheckpoint',
+      path: 'trip_route_logs/$rideId+ride_requests/$rideId(route_log)',
+      operation: 'multi_path_update',
+      rideId: rideId,
+      action: () => _rootRef.update(payload),
+    );
 
     await _syncSharedTripCheckpoint(
       rideId: rideId,
@@ -258,7 +274,13 @@ class DriverTripSafetyService {
       updates['cancelled_at'] = nowMs;
     }
 
-    await _rootRef.child('shared_trips/${shareMeta.token}').update(updates);
+    try {
+      await _rootRef.child('shared_trips/${shareMeta.token}').update(updates);
+    } catch (error) {
+      if (!isRealtimeDatabasePermissionDenied(error)) {
+        rethrow;
+      }
+    }
   }
 
   Future<void> _syncSharedTripCheckpoint({
@@ -271,15 +293,21 @@ class DriverTripSafetyService {
       return;
     }
 
-    await _rootRef.child('shared_trips/${shareMeta.token}').update({
-      'status': status,
-      'live_location': <String, dynamic>{
-        'lat': position.latitude,
-        'lng': position.longitude,
+    try {
+      await _rootRef.child('shared_trips/${shareMeta.token}').update({
+        'status': status,
+        'live_location': <String, dynamic>{
+          'lat': position.latitude,
+          'lng': position.longitude,
+          'updated_at': rtdb.ServerValue.timestamp,
+        },
         'updated_at': rtdb.ServerValue.timestamp,
-      },
-      'updated_at': rtdb.ServerValue.timestamp,
-    });
+      });
+    } catch (error) {
+      if (!isRealtimeDatabasePermissionDenied(error)) {
+        rethrow;
+      }
+    }
   }
 
   Future<_DriverShareMeta?> _activeShareMetaForRide(String rideId) async {
@@ -348,7 +376,7 @@ class DriverTripSafetyService {
     final isAligned = mismatchReasons.isEmpty;
     final reviewStatus = isAligned ? 'aligned' : 'manual_review';
 
-    await _rootRef.update(<String, dynamic>{
+    final payload = <String, dynamic>{
       'trip_route_logs/$rideId/routeConsistency/driverLastCheck':
           <String, dynamic>{
         'checkId': checkRef.key,
@@ -381,7 +409,14 @@ class DriverTripSafetyService {
         'updatedAt': rtdb.ServerValue.timestamp,
       },
       'trip_route_logs/$rideId/updatedAt': rtdb.ServerValue.timestamp,
-    });
+    };
+    await runOptionalRealtimeDatabaseWrite(
+      source: 'trip_safety.logRouteConsistencyCheck',
+      path: 'trip_route_logs/$rideId/routeConsistency',
+      operation: 'multi_path_update',
+      rideId: rideId,
+      action: () => _rootRef.update(payload),
+    );
   }
 
   Future<void> updateSettlementHook({
@@ -471,7 +506,13 @@ class DriverTripSafetyService {
       'trip_route_logs/$rideId/updatedAt': rtdb.ServerValue.timestamp,
     };
 
-    await _rootRef.update(safeDriverUpdates);
+    await runOptionalRealtimeDatabaseWrite(
+      source: 'trip_safety.updateSettlementHook.primary',
+      path: 'trip_route_logs+ride_requests+drivers+driver_trips',
+      operation: 'settlement_multi_path_update',
+      rideId: rideId,
+      action: () => _rootRef.update(safeDriverUpdates),
+    );
 
     final adminMirrorUpdates = <String, dynamic>{
       'trip_settlement_hooks/$rideId/rideId': rideId,

@@ -1,4 +1,5 @@
 import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter/foundation.dart';
 
 import '../config/driver_app_config.dart';
 
@@ -14,11 +15,21 @@ class DriverAlertSoundService {
       return;
     }
 
-    await _notificationPlayer.stop();
-    await _notificationPlayer.setReleaseMode(ReleaseMode.release);
-    await _notificationPlayer.play(
-      AssetSource(DriverAlertSoundConfig.alertAssetPath),
-    );
+    try {
+      await _notificationPlayer.stop();
+      await _notificationPlayer.setReleaseMode(ReleaseMode.release);
+      await _notificationPlayer.play(
+        AssetSource(DriverAlertSoundConfig.alertAssetPath),
+      );
+    } catch (error, stackTrace) {
+      debugPrint(
+        '[DriverAlertSound] playRideRequestAlert failed asset=${DriverAlertSoundConfig.alertAssetPath} error=$error',
+      );
+      debugPrintStack(
+        label: '[DriverAlertSound] playRideRequestAlert',
+        stackTrace: stackTrace,
+      );
+    }
   }
 
   Future<void> startIncomingCallAlert() async {
@@ -26,12 +37,22 @@ class DriverAlertSoundService {
       return;
     }
 
-    await _notificationPlayer.setReleaseMode(ReleaseMode.loop);
-    await _notificationPlayer.stop();
-    await _notificationPlayer.play(
-      AssetSource(DriverAlertSoundConfig.alertAssetPath),
-    );
-    _callAlertActive = true;
+    try {
+      await _notificationPlayer.setReleaseMode(ReleaseMode.loop);
+      await _notificationPlayer.stop();
+      await _notificationPlayer.play(
+        AssetSource(DriverAlertSoundConfig.alertAssetPath),
+      );
+      _callAlertActive = true;
+    } catch (error, stackTrace) {
+      debugPrint(
+        '[DriverAlertSound] startIncomingCallAlert failed asset=${DriverAlertSoundConfig.alertAssetPath} error=$error',
+      );
+      debugPrintStack(
+        label: '[DriverAlertSound] startIncomingCallAlert',
+        stackTrace: stackTrace,
+      );
+    }
   }
 
   Future<void> stopIncomingCallAlert() async {
@@ -48,8 +69,18 @@ class DriverAlertSoundService {
       return;
     }
 
-    await _chatPlayer.stop();
-    await _chatPlayer.play(AssetSource(DriverAlertSoundConfig.alertAssetPath));
+    try {
+      await _chatPlayer.stop();
+      await _chatPlayer.play(AssetSource(DriverAlertSoundConfig.alertAssetPath));
+    } catch (error, stackTrace) {
+      debugPrint(
+        '[DriverAlertSound] playChatAlert failed asset=${DriverAlertSoundConfig.alertAssetPath} error=$error',
+      );
+      debugPrintStack(
+        label: '[DriverAlertSound] playChatAlert',
+        stackTrace: stackTrace,
+      );
+    }
   }
 
   Future<void> dispose() async {

@@ -6641,30 +6641,60 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       throw StateError('missing_driver_id');
     }
 
-    final rootUpdates = <String, Object?>{};
+    final primaryUpdates = <String, Object?>{};
     rideUpdates.forEach((key, value) {
-      rootUpdates['ride_requests/$rideId/$key'] = value;
+      primaryUpdates['ride_requests/$rideId/$key'] = value;
     });
     driverUpdates.forEach((key, value) {
-      rootUpdates['drivers/$driverId/$key'] = value;
+      primaryUpdates['drivers/$driverId/$key'] = value;
     });
+
+    final secondaryUpdates = <String, Object?>{};
     if (clearActiveRide) {
-      rootUpdates['driver_active_ride/$driverId'] = null;
+      secondaryUpdates['driver_active_ride/$driverId'] = null;
     } else if (activeRideUpdates != null) {
       activeRideUpdates.forEach((key, value) {
-        rootUpdates['driver_active_ride/$driverId/$key'] = value;
+        secondaryUpdates['driver_active_ride/$driverId/$key'] = value;
       });
     }
 
     _logRtdb(
-      'multi-path update start rideId=$rideId rideKeys=${rideUpdates.keys.length} driverKeys=${driverUpdates.keys.length} activeRideKeys=${clearActiveRide ? 0 : (activeRideUpdates?.keys.length ?? 0)} clearActiveRide=$clearActiveRide',
+      'multi-path update start rideId=$rideId rideKeys=${rideUpdates.keys.length} '
+      'driverKeys=${driverUpdates.keys.length} '
+      'secondaryKeys=${secondaryUpdates.length} clearActiveRide=$clearActiveRide',
     );
     try {
-      await rtdb.FirebaseDatabase.instance.ref().update(rootUpdates);
-      _logRtdb('multi-path update success rideId=$rideId');
+      await rtdb.FirebaseDatabase.instance.ref().update(primaryUpdates);
+      _logRtdb('multi-path primary update success rideId=$rideId');
     } catch (error) {
-      _logRtdb('multi-path update failure rideId=$rideId error=$error');
+      final code = error is FirebaseException ? error.code : 'unknown';
+      _logRtdb(
+        '[RTDB_WRITE] phase=error operation=multi_path_update_primary '
+        'rideId=$rideId uid=$driverId paths=ride_requests+drivers code=$code error=$error',
+      );
+      _logRtdb('multi-path primary update failure rideId=$rideId error=$error');
       rethrow;
+    }
+
+    if (secondaryUpdates.isEmpty) {
+      return;
+    }
+
+    final secondaryOk = await runOptionalRealtimeDatabaseWrite(
+      source: 'driver_map.commit_driver_active_ride',
+      path: 'driver_active_ride/$driverId',
+      operation: clearActiveRide ? 'clear' : 'merge',
+      rideId: rideId,
+      action: () =>
+          rtdb.FirebaseDatabase.instance.ref().update(secondaryUpdates),
+    );
+    if (!secondaryOk) {
+      _logRtdb(
+        'driver_active_ride phase skipped (optional write denied) rideId=$rideId '
+        'driverId=$driverId clearActiveRide=$clearActiveRide',
+      );
+    } else {
+      _logRtdb('multi-path secondary driver_active_ride success rideId=$rideId');
     }
   }
 
@@ -6909,66 +6939,85 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     final rideRef = _rideRequestsRef.child(rideId);
-    final transactionResult = await rideRef.runTransaction((currentData) {
-      final currentRide = _asStringDynamicMap(currentData);
-      if (currentRide == null) {
-        return rtdb.Transaction.abort();
-      }
+    late final rtdb.TransactionResult transactionResult;
+    try {
+      transactionResult = await rideRef.runTransaction((currentData) {
+        final currentRide = _asStringDynamicMap(currentData);
+        if (currentRide == null) {
+          return rtdb.Transaction.abort();
+        }
 
-      final currentCanonicalState = TripStateMachine.canonicalStateFromSnapshot(
-        currentRide,
-      );
-      if (!TripStateMachine.isPendingDriverAssignmentState(
-              currentCanonicalState) ||
-          _valueAsText(currentRide['driver_id']) != driverId) {
-        return rtdb.Transaction.abort();
-      }
+        final currentCanonicalState =
+            TripStateMachine.canonicalStateFromSnapshot(
+          currentRide,
+        );
+        if (!TripStateMachine.isPendingDriverAssignmentState(
+                currentCanonicalState) ||
+            _valueAsText(currentRide['driver_id']) != driverId) {
+          return rtdb.Transaction.abort();
+        }
 
-      final updates = TripStateMachine.buildTransitionUpdate(
-        currentRide: currentRide,
-        nextCanonicalState: TripLifecycleState.searchingDriver,
-        timestampValue: rtdb.ServerValue.timestamp,
-        transitionSource: 'driver_assignment_release',
-        transitionActor: 'system',
-      );
+        final updates = TripStateMachine.buildTransitionUpdate(
+          currentRide: currentRide,
+          nextCanonicalState: TripLifecycleState.searchingDriver,
+          timestampValue: rtdb.ServerValue.timestamp,
+          transitionSource: 'driver_assignment_release',
+          transitionActor: 'system',
+        );
 
-      final reindexMarket = _rideMarketFromData(currentRide);
-      return rtdb.Transaction.success(
-        Map<String, dynamic>.from(currentRide)
-          ..addAll(updates)
-          ..addAll(<String, dynamic>{
-            'driver_id': 'waiting',
-            'driver_name': null,
-            'car': null,
-            'plate': null,
-            'rating': null,
-            'driver_lat': null,
-            'driver_lng': null,
-            'driver_heading': null,
-            'assignment_expires_at': null,
-            'driver_response_timeout_at': null,
-            'assignment_timeout_ms': null,
-            'last_assignment_driver_id': driverId,
-            'last_assignment_release_reason': reason,
-            if (reindexMarket != null && reindexMarket.isNotEmpty)
-              'market': reindexMarket,
-          }),
+        final reindexMarket = _rideMarketFromData(currentRide);
+        return rtdb.Transaction.success(
+          Map<String, dynamic>.from(currentRide)
+            ..addAll(updates)
+            ..addAll(<String, dynamic>{
+              'driver_id': 'waiting',
+              'driver_name': null,
+              'car': null,
+              'plate': null,
+              'rating': null,
+              'driver_lat': null,
+              'driver_lng': null,
+              'driver_heading': null,
+              'assignment_expires_at': null,
+              'driver_response_timeout_at': null,
+              'assignment_timeout_ms': null,
+              'last_assignment_driver_id': driverId,
+              'last_assignment_release_reason': reason,
+              if (reindexMarket != null && reindexMarket.isNotEmpty)
+                'market': reindexMarket,
+            }),
+        );
+      }, applyLocally: false);
+    } catch (error) {
+      final code = error is FirebaseException ? error.code : 'unknown';
+      _logRtdb(
+        '[RTDB_WRITE] phase=error operation=transaction_assignment_release '
+        'rideId=$rideId uid=$driverId path=ride_requests/$rideId code=$code error=$error',
       );
-    }, applyLocally: false);
+      return false;
+    }
 
     if (!transactionResult.committed) {
       return false;
     }
 
-    await _commitRideAndDriverState(
-      rideId: rideId,
-      rideUpdates: const <String, dynamic>{},
-      driverUpdates: _buildDriverPresenceUpdate(
-        status: 'idle',
-        isAvailable: true,
-      ),
-      clearActiveRide: true,
-    );
+    try {
+      await _commitRideAndDriverState(
+        rideId: rideId,
+        rideUpdates: const <String, dynamic>{},
+        driverUpdates: _buildDriverPresenceUpdate(
+          status: 'idle',
+          isAvailable: true,
+        ),
+        clearActiveRide: true,
+      );
+    } catch (error) {
+      final code = error is FirebaseException ? error.code : 'unknown';
+      _logRtdb(
+        '[RTDB_WRITE] phase=error operation=post_assignment_release_presence '
+        'rideId=$rideId uid=$driverId code=$code error=$error',
+      );
+    }
 
     if (resetLocalState &&
         (_driverActiveRideId == rideId || _currentRideId == rideId)) {
