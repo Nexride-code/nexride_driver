@@ -123,12 +123,17 @@ Future<DriverProfileFetchResult> fetchDriverProfileRecord({
   debugPrint(
     '[DriverProfile] fetch started source=$source uid=$uid path=$path mode=get_timeout=${kDriverProfileReadTimeout.inSeconds}s',
   );
+  debugPrint(
+    '[DRIVER_PROFILE_CHECK] uid=$uid path=$path op=get createIfMissing=$createIfMissing',
+  );
 
   DataSnapshot? snapshot;
   String? readError;
+  Object? readException;
   try {
     snapshot = await profileRef.get().timeout(kDriverProfileReadTimeout);
   } on TimeoutException catch (error, stackTrace) {
+    readException = error;
     readError = 'read_timeout:$error';
     debugPrint(
       '[DriverProfile] drivers node read TIMEOUT source=$source uid=$uid path=$path',
@@ -138,6 +143,7 @@ Future<DriverProfileFetchResult> fetchDriverProfileRecord({
       stackTrace: stackTrace,
     );
   } catch (error, stackTrace) {
+    readException = error;
     readError = error.toString();
     _logFirebaseDatabaseError(
       '[DriverProfile] drivers node read FAILED source=$source uid=$uid path=$path',
@@ -151,6 +157,8 @@ Future<DriverProfileFetchResult> fetchDriverProfileRecord({
 
   final readSucceeded = snapshot != null;
   final snapshotExists = snapshot?.exists == true;
+  final readDeniedByRules = readException != null &&
+      isRealtimeDatabasePermissionDenied(readException);
   final rawValue = snapshot?.value;
   final rawValueType = rawValue?.runtimeType.toString() ?? 'null';
 
@@ -226,7 +234,9 @@ Future<DriverProfileFetchResult> fetchDriverProfileRecord({
           missingAvailabilityFlags ||
           missingOnlineAlias);
 
-  if (readSucceeded && !snapshotExists && createIfMissing) {
+  if (createIfMissing &&
+      !snapshotExists &&
+      (readSucceeded || readDeniedByRules)) {
     final verification =
         Map<String, dynamic>.from(profile['verification'] as Map? ?? const {});
     debugPrint(
@@ -243,6 +253,9 @@ Future<DriverProfileFetchResult> fetchDriverProfileRecord({
     try {
       await profileRef.update(driverPayload);
       createdFallbackProfile = true;
+      debugPrint(
+        '[DRIVER_PROFILE_REPAIR] uid=$uid path=$path op=seed_create ok=true readDenied=$readDeniedByRules',
+      );
       debugPrint(
         '[DriverProfile] drivers node create/repair write ok source=$source uid=$uid path=$path',
       );

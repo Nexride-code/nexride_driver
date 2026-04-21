@@ -29,6 +29,7 @@ import '../support/driver_dispatch_support.dart';
 import '../support/driver_profile_bootstrap_support.dart';
 import '../support/driver_profile_support.dart';
 import '../support/realtime_database_error_support.dart';
+import '../support/rtdb_flow_debug_log.dart';
 import '../support/ride_chat_support.dart';
 import '../trip_sync/trip_state_machine.dart';
 import '../widgets/driver_dashboard_panel.dart';
@@ -9734,6 +9735,51 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _rideRequestsListenerBoundCity = driverCity;
 
     try {
+      final discoveryUid = _effectiveDriverId.trim();
+      if (discoveryUid.isEmpty) {
+        _rideRequestsListenerBoundCity = null;
+        rtdbFlowLog(
+          '[DRIVER_LISTENER_FAIL]',
+          'uid=empty market=$driverCity op=abort reason=missing_driver_id',
+        );
+        return false;
+      }
+      rtdbFlowLog(
+        '[MATCH_FLOW]',
+        'phase=precheck_discovery uid=$discoveryUid market=$driverCity',
+      );
+      rtdbFlowLog(
+        '[RULES_PATH]',
+        'path=drivers/$discoveryUid op=get context=discovery_precheck',
+      );
+      try {
+        final driverSnap = await _driversRef.child(discoveryUid).get();
+        rtdbFlowLog(
+          '[DRIVER_LISTENER_START]',
+          'drivers_exists=${driverSnap.exists} uid=$discoveryUid market=$driverCity',
+        );
+        if (!driverSnap.exists) {
+          final u = FirebaseAuth.instance.currentUser;
+          if (u != null && u.uid == discoveryUid) {
+            rtdbFlowLog(
+              '[DRIVER_PROFILE_REPAIR]',
+              'uid=$discoveryUid reason=precheck_missing op=fetchDriverProfileRecord',
+            );
+            await fetchDriverProfileRecord(
+              rootRef: rtdb.FirebaseDatabase.instance.ref(),
+              user: u,
+              source: 'driver_map_discovery_precheck',
+              createIfMissing: true,
+            );
+          }
+        }
+      } catch (precheckError) {
+        rtdbFlowLog(
+          '[DRIVER_LISTENER_FAIL]',
+          'uid=$discoveryUid market=$driverCity op=precheck error=$precheckError',
+        );
+      }
+
       _logRideReq(
         'request listener STREAM subscribed market=$driverCity reason=$reason token=$listenerToken',
       );
@@ -9765,6 +9811,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             '[RTDB_DISCOVERY] STREAM_ERROR path=ride_requests?orderByChild=market&equalTo=$driverCity '
             'market=$driverCity authUid=$uid permissionDenied=$denied error=$error',
           );
+          rtdbFlowLog(
+            '[DRIVER_LISTENER_FAIL]',
+            'uid=$uid market=$driverCity op=onValue_stream denied=$denied error=$error',
+          );
           _log('ride listener error=$error');
           _logRideReq('request listener stream ERROR market=$driverCity error=$error');
           if (isRealtimeDatabasePermissionDenied(error)) {
@@ -9778,9 +9828,19 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               'ride_requests query permission denied — check RTDB rules (drivers node + market query) and deploy database.rules.json',
             );
             _showSnackBarSafely(
-              const SnackBar(
-                content: Text(
-                  'Cannot load ride requests (permission). Go online again after deploy, or confirm drivers/{uid} exists in Realtime Database.',
+              SnackBar(
+                content: const Text(
+                  'Unable to connect to ride listings. Check your connection, then tap Retry or go online again.',
+                ),
+                action: SnackBarAction(
+                  label: 'Retry',
+                  onPressed: () {
+                    unawaited(
+                      _listenForRideRequests(
+                        reason: 'snackbar_retry_after_stream_permission',
+                      ),
+                    );
+                  },
                 ),
               ),
             );
@@ -9816,7 +9876,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logPopup('listener attach FAILED error=$error');
       _logDiscoveryChain('listener attach FAILED error=$error');
       _showAvailabilityFailureNotice(
-        'Ride requests could not start. Please try GO ONLINE again.',
+        'Unable to load nearby ride requests. Please check your connection and tap GO ONLINE again.',
       );
       return false;
     }
