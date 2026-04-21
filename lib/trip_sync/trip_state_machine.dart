@@ -1,3 +1,5 @@
+import 'dart:developer' as developer;
+
 class TripLifecycleState {
   static const String requested = 'requested';
   static const String searchingDriver = 'searching_driver';
@@ -105,6 +107,7 @@ class TripStateMachine {
     return canonicalStateFromValues(
       tripState: rideData?['trip_state'],
       status: rideData?['status'],
+      assignedDriverId: rideData?['driver_id'],
     );
   }
 
@@ -153,9 +156,13 @@ class TripStateMachine {
   static String canonicalStateFromValues({
     dynamic tripState,
     dynamic status,
+    dynamic assignedDriverId,
   }) {
     final normalizedTripState = _normalizeText(tripState);
     final normalizedStatus = _normalizeText(status);
+    final assignedNorm = _normalizeText(assignedDriverId);
+    final hasConcreteDriver = assignedNorm.isNotEmpty &&
+        assignedNorm != 'waiting';
 
     String? canonicalFromTripStateField() {
       if (normalizedTripState == 'pending_driver_acceptance' ||
@@ -191,7 +198,32 @@ class TripStateMachine {
       if (isTerminal(fromLegacy)) {
         return fromTrip;
       }
-      return fromTrip;
+      var effective = fromTrip;
+      // Partial RTDB: [trip_state] can still be open-search while [driver_id] is set.
+      // Prefer assigned / active lifecycle so rider UIs do not fall back to "searching".
+      if (hasConcreteDriver &&
+          (effective == TripLifecycleState.searchingDriver ||
+              effective == TripLifecycleState.requested)) {
+        if (isPendingDriverAssignmentState(fromLegacy) ||
+            isDriverActiveState(fromLegacy)) {
+          effective = fromLegacy;
+          developer.log(
+            '[MATCH_DEBUG][RIDER_STATE_ACCEPTED_LOCKED] '
+            'tripState=$normalizedTripState status=$normalizedStatus '
+            'driverId=$assignedNorm uplift=$effective',
+            name: 'nexride.trip_state',
+          );
+        } else if (fromLegacy == TripLifecycleState.searchingDriver) {
+          effective = TripLifecycleState.pendingDriverAction;
+          developer.log(
+            '[MATCH_DEBUG][RIDER_STATE_ACCEPTED_LOCKED] '
+            'tripState=$normalizedTripState status=$normalizedStatus '
+            'driverId=$assignedNorm uplift=$effective (bound_driver_stale_open_state)',
+            name: 'nexride.trip_state',
+          );
+        }
+      }
+      return effective;
     }
 
     return fromLegacy;

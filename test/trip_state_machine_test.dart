@@ -189,4 +189,15 @@ void main() {
       isNull,
     );
   });
+
+  test('bound driver_id uplifts stale searching trip_state for rider stability', () {
+    expect(
+      TripStateMachine.canonicalStateFromValues(
+        tripState: TripLifecycleState.searchingDriver,
+        status: 'searching',
+        assignedDriverId: 'driver_abc',
+      ),
+      TripLifecycleState.pendingDriverAction,
+    );
+  });
 }

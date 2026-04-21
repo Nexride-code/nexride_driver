@@ -263,6 +263,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   final Set<String> _suppressedRidePopupIds = <String>{};
   /// Accepted (or otherwise completed-on-this-device) ride IDs — never unsuppress, never popup again this session.
   final Set<String> _foreverSuppressedRidePopupIds = <String>{};
+  /// Terminal self-accept lock: after a successful accept transaction, discovery and
+  /// unavailable UI must not fight the active-trip flow for this [rideId] until trip end.
+  final Set<String> _terminalSelfAcceptedRideIds = <String>{};
   /// Prevents concurrent [showRideRequestPopup] opens from parallel RTDB snapshots.
   bool _ridePopupOpenPipelineLocked = false;
   int _lastActiveHeartbeatLogCount = 0;
@@ -2518,6 +2521,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _timedOutRideIds.clear();
     _declinedRideIds.clear();
     _suppressedRidePopupIds.clear();
+    _terminalSelfAcceptedRideIds.clear();
     _onlineSessionStartedAt = 0;
     _lastAvailabilityIntentOnline = false;
     _sessionTrackedRideId = null;
@@ -5832,11 +5836,45 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (n.isEmpty) {
       return false;
     }
+    if (_terminalSelfAcceptedRideIds.contains(n)) {
+      return true;
+    }
     return n == _currentRideId || n == _driverActiveRideId;
+  }
+
+  bool _isTerminalSelfAcceptedRide(String rideId) {
+    final n = rideId.trim();
+    return n.isNotEmpty && _terminalSelfAcceptedRideIds.contains(n);
+  }
+
+  /// Active-trip context wins over market discovery (handles brief post-accept races).
+  String? _dominantActiveRideIdForDiscovery() {
+    final c = _currentRideId?.trim();
+    if (c != null && c.isNotEmpty) {
+      return c;
+    }
+    final d = _driverActiveRideId?.trim();
+    if (d != null && d.isNotEmpty) {
+      return d;
+    }
+    final listener = _activeRideListenerRideId?.trim();
+    if (listener != null &&
+        listener.isNotEmpty &&
+        _terminalSelfAcceptedRideIds.contains(listener)) {
+      return listener;
+    }
+    return null;
   }
 
   String? _popupLocalSkipReason(String rideId) {
     final normalizedId = rideId.trim();
+    if (_terminalSelfAcceptedRideIds.contains(normalizedId)) {
+      _logRideReq(
+        '[MATCH_DEBUG][POPUP_SUPPRESSED_SELF_ACCEPTED] rideId=$normalizedId '
+        'reason=terminal_local_accept_lock',
+      );
+      return 'terminal_self_accepted';
+    }
     if (_foreverSuppressedRidePopupIds.contains(normalizedId)) {
       return 'forever_suppressed_after_accept';
     }
@@ -5872,6 +5910,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     Map<String, dynamic>? rideData,
   ) {
     final n = rideId.trim();
+    if (_terminalSelfAcceptedRideIds.contains(n)) {
+      _logRideReq(
+        '[MATCH_DEBUG][DISCOVERY_IGNORED_ACCEPTED_RIDE] rideId=$n '
+        'source=discovery_recheck_suppressed',
+      );
+      return;
+    }
     if (_suppressedRidePopupIds.contains(n)) {
       _logRtdb(
         'popup skipped reason=locally_suppressed_after_accept rideId=$n',
@@ -5924,6 +5969,15 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     Map<String, dynamic> rideData,
   ) {
     final trimmedId = rideId.trim();
+    if (_terminalSelfAcceptedRideIds.contains(trimmedId)) {
+      _logRideReq(
+        '[MATCH_DEBUG][DISCOVERY_IGNORED_ACCEPTED_RIDE] rideId=$rideId '
+        'source=open_pool_discovery',
+      );
+      _logPopupFix('skip reason=terminal_self_accepted_local rideId=$rideId');
+      _logPopupServerSkip(rideId, rideData, 'terminal_self_accepted_local');
+      return 'terminal_self_accepted_local';
+    }
     if (_foreverSuppressedRidePopupIds.contains(trimmedId)) {
       _logPopupFix('skip reason=forever_suppressed_local rideId=$rideId');
       _logPopupServerSkip(rideId, rideData, 'forever_suppressed_local');
@@ -6193,13 +6247,23 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final canonicalState =
         TripStateMachine.canonicalStateFromSnapshot(rideData);
     return _valueAsText(rideData['driver_id']) == _effectiveDriverId &&
-        TripStateMachine.isDriverActiveState(canonicalState);
+        (TripStateMachine.isDriverActiveState(canonicalState) ||
+            TripStateMachine.isPendingDriverAssignmentState(canonicalState));
   }
 
   String _acceptBlockedMessage({
     required String blockedReason,
     required Map<String, dynamic>? rideData,
+    String? rideId,
   }) {
+    final rid = rideId?.trim() ?? '';
+    if (rid.isNotEmpty && _terminalSelfAcceptedRideIds.contains(rid)) {
+      _logRideReq(
+        '[MATCH_DEBUG][UNAVAILABLE_SKIPPED_SELF_ACCEPTED] rideId=$rid '
+        'source=accept_blocked_message',
+      );
+      return 'This trip is already linked to you.';
+    }
     if (rideData != null && _rideAlreadyAcceptedByCurrentDriver(rideData)) {
       return 'This ride is already confirmed for you.';
     }
@@ -6988,6 +7052,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             TripStateMachine.canonicalStateFromValues(
               tripState: activeRideData['trip_state'],
               status: activeRideData['status'],
+              assignedDriverId: activeRideData['driver_id'],
             ),
           );
 
@@ -7297,11 +7362,18 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             );
             if ((_activePopupRideId != rideId || !_popupOpen) &&
                 !_hasActivePopup) {
-              if (_foreverSuppressedRidePopupIds.contains(rideId.trim())) {
+              if (_foreverSuppressedRidePopupIds.contains(rideId.trim()) ||
+                  _terminalSelfAcceptedRideIds.contains(rideId.trim())) {
                 _logRideReq(
                   '[MATCH_DEBUG][POPUP_SUPPRESSED_ACCEPTED] rideId=$rideId '
                   'source=active_ride_child_listener_pending',
                 );
+                if (_terminalSelfAcceptedRideIds.contains(rideId.trim())) {
+                  _logRideReq(
+                    '[MATCH_DEBUG][POPUP_SUPPRESSED_SELF_ACCEPTED] rideId=$rideId '
+                    'source=active_ride_child_listener_pending_terminal',
+                  );
+                }
               } else {
                 final matchedRide = _matchRideForPopup(
                   rideId,
@@ -7906,6 +7978,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     bool logSkips = true,
     bool ignoreLocalState = false,
   }) async {
+    if (_isTerminalSelfAcceptedRide(rideId)) {
+      _logRideReq(
+        '[MATCH_DEBUG][POPUP_SUPPRESSED_SELF_ACCEPTED] rideId=$rideId '
+        'source=load_live_popup_ride',
+      );
+      return null;
+    }
     final snapshot =
         await _rideRequestChildGetIosSafe(rideId, 'load_live_popup_ride');
     final liveRide = _matchRideForPopup(
@@ -7939,6 +8018,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     bool marketDiscoveryCandidate = false,
   }) {
     final trimmedRideId = rideId.trim();
+    if (_terminalSelfAcceptedRideIds.contains(trimmedRideId)) {
+      _logRideReq(
+        '[MATCH_DEBUG][DISCOVERY_IGNORED_ACCEPTED_RIDE] rideId=$rideId '
+        'source=_matchRideForPopup',
+      );
+      return null;
+    }
     if (_foreverSuppressedRidePopupIds.contains(trimmedRideId)) {
       _logRideReq(
         '[MATCH_DEBUG][POPUP_SUPPRESSED_ACCEPTED] rideId=$rideId '
@@ -8480,6 +8566,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _declinedRideIds.clear();
     _suppressedRidePopupIds.clear();
     _foreverSuppressedRidePopupIds.clear();
+    _terminalSelfAcceptedRideIds.clear();
     _cancelPendingRouteRequests(reason: 'go_offline');
     _onlineSessionStartedAt = 0;
     _lastAvailabilityIntentOnline = false;
@@ -9193,21 +9280,28 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           return;
         }
 
-        // Only [_driverActiveRideId] / [_currentRideId] block discovery.
-        // [_activeRideListenerRideId] can lag RTDB and must not suppress new requests.
-        if (_driverActiveRideId?.trim().isNotEmpty == true ||
-            _currentRideId?.trim().isNotEmpty == true) {
+        // Active trip (or terminal accept + active listener) blocks market discovery.
+        final dominantRideId = _dominantActiveRideIdForDiscovery();
+        if (dominantRideId != null && dominantRideId.isNotEmpty) {
           _logDriverReq(
-            'skippedReason=active_trip_guard driverActive=$_driverActiveRideId '
-            'current=$_currentRideId source=$source',
+            'skippedReason=active_trip_guard dominant=$dominantRideId '
+            'driverActive=$_driverActiveRideId current=$_currentRideId '
+            'listenerRide=$_activeRideListenerRideId source=$source',
           );
           _logRideReq(
-            'snapshot skipped active-trip guard driverActive=$_driverActiveRideId '
-            'current=$_currentRideId source=$source',
+            '[MATCH_DEBUG][ACTIVE_TRIP_WON_OVER_DISCOVERY] rideId=$dominantRideId '
+            'driverActive=$_driverActiveRideId current=$_currentRideId '
+            'listenerRide=$_activeRideListenerRideId '
+            'terminalLocked=${_terminalSelfAcceptedRideIds.contains(dominantRideId)} '
+            'source=$source',
+          );
+          _logRideReq(
+            'snapshot skipped active-trip guard dominant=$dominantRideId '
+            'driverActive=$_driverActiveRideId current=$_currentRideId source=$source',
           );
           _logDiscoveryChain(
-            'snapshot_blocked active_ride_guard current=$_currentRideId '
-            'driverActive=$_driverActiveRideId source=$source',
+            'snapshot_blocked active_ride_guard dominant=$dominantRideId '
+            'current=$_currentRideId driverActive=$_driverActiveRideId source=$source',
           );
           return;
         }
@@ -9219,14 +9313,22 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           final aid = activePopupRideId.trim();
           final skipUnavailableDismissal =
               _foreverSuppressedRidePopupIds.contains(aid) ||
+                  _terminalSelfAcceptedRideIds.contains(aid) ||
                   _currentRideId == activePopupRideId ||
                   _driverActiveRideId == activePopupRideId;
           if (skipUnavailableDismissal) {
             _logRideReq(
               '[MATCH_DEBUG][UNAVAILABLE_RENDER_BLOCKED] rideId=$activePopupRideId '
               'forever=${_foreverSuppressedRidePopupIds.contains(aid)} '
+              'terminal=${_terminalSelfAcceptedRideIds.contains(aid)} '
               'currentRide=$_currentRideId driverActive=$_driverActiveRideId',
             );
+            if (_terminalSelfAcceptedRideIds.contains(aid)) {
+              _logRideReq(
+                '[MATCH_DEBUG][UNAVAILABLE_SKIPPED_SELF_ACCEPTED] rideId=$activePopupRideId '
+                'source=discovery_popup_dismissal_guard',
+              );
+            }
           } else {
             var activePopupRideData =
                 _asStringDynamicMap(rideMap[activePopupRideId]);
@@ -9699,6 +9801,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       'showRideRequestPopup enter rideId=${ride.rideId} reserved=$rideAlreadyReserved '
       'online=$_isOnline popupOpen=$_popupOpen hasActive=$_hasActivePopup',
     );
+    if (_isTerminalSelfAcceptedRide(ride.rideId)) {
+      _logRideReq(
+        '[MATCH_DEBUG][POPUP_SUPPRESSED_SELF_ACCEPTED] rideId=${ride.rideId} '
+        'source=showRideRequestPopup_entry_terminal',
+      );
+      _logRidePopup(
+        'skip rideId=${ride.rideId} reason=terminal_self_accepted',
+      );
+      return;
+    }
     if (_foreverSuppressedRidePopupIds.contains(ride.rideId.trim())) {
       _logRideReq(
         '[MATCH_DEBUG][POPUP_SUPPRESSED_ACCEPTED] rideId=${ride.rideId} '
@@ -10455,6 +10567,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
 
       if (action == _RidePopupAction.blocked) {
+        final blockedRid = popupRide.rideId.trim();
+        if (_terminalSelfAcceptedRideIds.contains(blockedRid) ||
+            _foreverSuppressedRidePopupIds.contains(blockedRid)) {
+          _logRideReq(
+            '[MATCH_DEBUG][UNAVAILABLE_SKIPPED_SELF_ACCEPTED] rideId=$blockedRid '
+            'source=popup_action_blocked',
+          );
+          _clearRidePreview();
+          return;
+        }
         _popupDismissedReason = 'accept_blocked';
         _clearRidePreview();
         _rearmRideRequestListener('accept blocked rideId=${popupRide.rideId}');
@@ -10700,6 +10822,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
 
       if (ridePayload == null) {
+        if (_terminalSelfAcceptedRideIds.contains(rideId.trim())) {
+          _logRideReq(
+            '[MATCH_DEBUG][UNAVAILABLE_SKIPPED_SELF_ACCEPTED] rideId=$rideId '
+            'source=accept_tx_null_while_terminal_locked',
+          );
+          return false;
+        }
         final latestBlockedReason = blockedReason != 'unknown'
             ? blockedReason
             : _acceptBlockedReasonFromRideData(rideId, latestRideData);
@@ -10726,6 +10855,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               _acceptBlockedMessage(
                 blockedReason: latestBlockedReason,
                 rideData: latestRideData,
+                rideId: rideId,
               ),
             ),
           ),
@@ -10791,6 +10921,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
 
       final rid = rideId.trim();
+      _terminalSelfAcceptedRideIds.add(rid);
+      _logRideReq(
+        '[MATCH_DEBUG][ACCEPT_SUCCESS] rideId=$rideId driverId=$_effectiveDriverId '
+        'trip_state=$committedCanonicalForCommit ui_status=$committedStatus',
+      );
       _foreverSuppressedRidePopupIds.add(rid);
       _suppressedRidePopupIds.add(rid);
       _presentedRideIds.remove(rid);
@@ -10798,6 +10933,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         '[MATCH_DEBUG][POPUP_SUPPRESSED_ACCEPTED] rideId=$rideId driverId=$_effectiveDriverId '
         'trip_state=$committedCanonicalForCommit',
       );
+      _trackRideForCurrentSession(rideId);
 
       final driverPresence = _buildDriverPresenceUpdate(
         status: committedStatus,
@@ -10831,7 +10967,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'ui_status=$committedStatus trip_state=$committedCanonicalForCommit '
         'source=accept_after_driver_sync',
       );
-      _trackRideForCurrentSession(rideId);
       _startCallListener(rideId);
       if (mounted) {
         setState(() {
@@ -11557,6 +11692,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final previousRideId = _currentRideId;
     final driverId = _effectiveDriverId;
     if (previousRideId != null && previousRideId.isNotEmpty) {
+      final p = previousRideId.trim();
+      if (p.isNotEmpty) {
+        _terminalSelfAcceptedRideIds.remove(p);
+      }
       await _performLocalCallCleanup(
         rideId: previousRideId,
         logCleanup: false,
