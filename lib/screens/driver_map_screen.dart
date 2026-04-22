@@ -2096,11 +2096,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     _startDriverChatListener(rideId);
-    _scheduleActiveRouteRefresh(
-      force: true,
-      reason: 'resume_rehydrate_route',
-      debounce: Duration.zero,
-    );
     if (_activeRideListenerRideId != rideId ||
         _activeRideSubscription == null) {
       unawaited(_listenToActiveRide(rideId));
@@ -4645,6 +4640,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     try {
+      _logRideCall('[CALL_JOIN_START] rideId=$rideId');
       await _callService.ensureJoinedVoiceChannel(
         channelId: rideId,
         uid: uid,
@@ -4652,7 +4648,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         muted: _callMuted,
       );
       _callJoinedChannel = true;
-      _logRideCall('joined channel rideId=$rideId');
+      _logRideCall('[CALL_JOIN_OK] rideId=$rideId');
       await _updateParticipantStateSafely(
         source: 'join_accepted_call',
         rideId: rideId,
@@ -4662,7 +4658,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         foreground: _appLifecycleState == AppLifecycleState.resumed,
       );
     } catch (error) {
-      _logRideCall('join failed rideId=$rideId error=$error');
+      _logRideCall('[CALL_JOIN_FAIL] rideId=$rideId error=$error');
       final message = error is RideCallException
           ? error.message
           : 'Unable to connect the call right now.';
@@ -4831,6 +4827,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     _setStartingVoiceCall(true);
     try {
+      _logRideCall('[CALL_START] rideId=$rideId initiator=driver');
       if (_currentCallSession != null && !_currentCallSession!.isTerminal) {
         _refreshCallOverlayEntry();
         _showSnackBarSafely(
@@ -4842,9 +4839,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
 
       if (!_callService.hasRtcConfiguration) {
+        _logRideCall('[CALL_CONFIG_MISSING] rideId=$rideId');
         _showSnackBarSafely(
           SnackBar(
-            content: Text(_callService.missingConfigurationMessage),
+            content: Text(_callService.unavailableUserMessage),
           ),
         );
         return;
@@ -4858,11 +4856,14 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
 
       try {
+        _logRideCall('[CALL_TOKEN_FETCH_START] rideId=$rideId');
         await _callService.prefetchAgoraToken(
           channelId: rideId,
           uid: driverId,
         );
+        _logRideCall('[CALL_TOKEN_FETCH_OK] rideId=$rideId');
       } on RideCallException catch (error) {
+        _logRideCall('[CALL_TOKEN_FETCH_FAIL] rideId=$rideId error=$error');
         _showSnackBarSafely(
           SnackBar(
             content: Text(error.message),
@@ -4910,9 +4911,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     if (!_callService.hasRtcConfiguration) {
+      _logRideCall('[CALL_CONFIG_MISSING] rideId=${session.rideId}');
       _showSnackBarSafely(
         SnackBar(
-          content: Text(_callService.missingConfigurationMessage),
+          content: Text(_callService.unavailableUserMessage),
         ),
       );
       return;
@@ -4937,11 +4939,14 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     try {
+      _logRideCall('[CALL_TOKEN_FETCH_START] rideId=${session.rideId}');
       await _callService.prefetchAgoraToken(
         channelId: session.rideId,
         uid: driverId,
       );
+      _logRideCall('[CALL_TOKEN_FETCH_OK] rideId=${session.rideId}');
     } on RideCallException catch (error) {
+      _logRideCall('[CALL_TOKEN_FETCH_FAIL] rideId=${session.rideId} error=$error');
       _showSnackBarSafely(
         SnackBar(
           content: Text(error.message),
@@ -8057,6 +8062,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     );
 
     final ref = _rideChatMessagesRef(rideId);
+    unawaited(_loadDriverChatSnapshot(rideId, ref));
     _driverChatSubscriptions.add(
       ref.onChildAdded.listen(
         (event) => _onDriverChatChildEvent(rideId, event),
@@ -8093,6 +8099,28 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         },
       ),
     );
+  }
+
+  Future<void> _loadDriverChatSnapshot(
+    String rideId,
+    rtdb.DatabaseReference ref,
+  ) async {
+    try {
+      _log('[CHAT_LOAD_START] role=driver rideId=$rideId');
+      final snapshot = await ref.get().timeout(const Duration(seconds: 6));
+      final parsed = parseRideChatSnapshot(rideId: rideId, raw: snapshot.value);
+      for (final message in parsed.messages) {
+        _driverChatMessagesById[message.id] = message;
+      }
+      _flushDriverChatMessageTable(rideId);
+      _log(
+        '[CHAT_LOAD_OK] role=driver rideId=$rideId count=${parsed.messages.length} '
+        'invalid=${parsed.invalidRecordCount}',
+      );
+    } catch (error) {
+      _log('[CHAT_LOAD_FAIL] role=driver rideId=$rideId error=$error');
+      _reportDriverChatIssue(rideId, 'load_failed', error: error);
+    }
   }
 
   void _rearmRideRequestListener(String reason) {
@@ -13024,6 +13052,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'local_temp_id': messageId,
         'created_at': rtdb.ServerValue.timestamp,
         'created_at_client': clientCreatedAt,
+        'client_status': 'sent',
+        'server_ack': true,
         'status': 'sent',
         'read': false,
       };
@@ -13056,6 +13086,22 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           'ride_requests/$normalizedRideId/chat_updated_at':
               rtdb.ServerValue.timestamp,
           'ride_requests/$normalizedRideId/has_chat_messages': true,
+          '${canonicalRideChatMetaPath(normalizedRideId)}/rideId':
+              normalizedRideId,
+          '${canonicalRideChatMetaPath(normalizedRideId)}/rider_id':
+              _currentRiderIdForRide,
+          '${canonicalRideChatMetaPath(normalizedRideId)}/driver_id': senderId,
+          '${canonicalRideChatMetaPath(normalizedRideId)}/created_at':
+              rtdb.ServerValue.timestamp,
+          '${canonicalRideChatMetaPath(normalizedRideId)}/updated_at':
+              rtdb.ServerValue.timestamp,
+          '${canonicalRideChatMetaPath(normalizedRideId)}/last_message':
+              lastMessageMeta['text'],
+          '${canonicalRideChatMetaPath(normalizedRideId)}/last_message_sender_id':
+              senderId,
+          '${canonicalRideChatMetaPath(normalizedRideId)}/last_message_at':
+              rtdb.ServerValue.timestamp,
+          '${canonicalRideChatMetaPath(normalizedRideId)}/status': 'active',
         }).timeout(_kRideChatSendTimeout);
 
         _confirmDriverOptimisticMessageSent(
@@ -13115,7 +13161,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     _startDriverChatListener(rideId);
-    _log('driver chat opened rideId=$rideId');
+    _log('[CHAT_OPEN] role=driver rideId=$rideId');
     _resetDriverUnreadCount(rideId);
     unawaited(
       _markDriverMessagesRead(
