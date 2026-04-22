@@ -9380,11 +9380,21 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             final rawDriverId = rideData == null
                 ? ''
                 : _valueAsText(rideData[RtdbRideRequestFields.driverId]);
+            final rawSearchTimeout = rideData == null
+                ? ''
+                : _valueAsText(rideData['search_timeout_at']);
+            final rawRequestExpires = rideData == null
+                ? ''
+                : _valueAsText(rideData['request_expires_at']);
+            final rawExpires = rideData == null
+                ? ''
+                : _valueAsText(rideData['expires_at']);
             _logRideReq(
               '[DRIVER_DISCOVERY_REJECT] rideId=$rideId reason='
               '${skipReason.isEmpty ? 'service_type_not_active' : skipReason} '
               'market_expected=$expectedMarket market_actual=$actualMarket '
-              'status=$rawStatus trip_state=$rawTripState driver_id=$rawDriverId',
+              'status=$rawStatus trip_state=$rawTripState driver_id=$rawDriverId '
+              'search_timeout_at=$rawSearchTimeout request_expires_at=$rawRequestExpires expires_at=$rawExpires',
             );
           } else {
             _logRideReq('[DRIVER_DISCOVERY_ACCEPT] rideId=$rideId');
