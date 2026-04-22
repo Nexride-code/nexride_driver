@@ -49,7 +49,7 @@ class RideChatSnapshot {
 
 String canonicalRideChatMessagesPath(String rideId) {
   final normalizedRideId = rideId.trim();
-  return 'chats/$normalizedRideId/messages';
+  return 'ride_chats/$normalizedRideId/messages';
 }
 
 RideChatMessage? parseRideChatMessageEntry({

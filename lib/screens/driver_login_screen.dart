@@ -156,10 +156,6 @@ class _DriverLoginScreenState extends State<DriverLoginScreen>
           'updatedAt': ServerValue.timestamp,
         },
       };
-      if (!hasActiveTrip) {
-        rootUpdates['driver_active_ride/${user.uid}'] = null;
-      }
-
       try {
         await rootRef.update(rootUpdates);
       } catch (error) {
@@ -168,7 +164,7 @@ class _DriverLoginScreenState extends State<DriverLoginScreen>
         }
 
         debugPrint(
-          '[DriverLogin] optional bootstrap write denied uid=${user.uid} verificationPath=$verificationPath activeRidePath=driver_active_ride/${user.uid} error=$error',
+          '[DriverLogin] optional bootstrap write denied uid=${user.uid} verificationPath=$verificationPath error=$error',
         );
         await driverRef.update(profileUpdate);
       }

@@ -240,8 +240,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     with WidgetsBindingObserver {
   final rtdb.DatabaseReference _rideRequestsRef =
       rtdb.FirebaseDatabase.instance.ref('ride_requests');
-  final rtdb.DatabaseReference _driverActiveRideRef =
-      rtdb.FirebaseDatabase.instance.ref('driver_active_ride');
   final rtdb.DatabaseReference _driversRef =
       rtdb.FirebaseDatabase.instance.ref('drivers');
   final CallService _callService = CallService();
@@ -732,14 +730,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         query: _driversRef.child(driverId),
         path: 'drivers/$driverId',
       ),
-      _readStartupSnapshot(
-        query: _driverActiveRideRef.child(driverId),
-        path: 'driver_active_ride/$driverId',
-      ),
     ]);
     final driverRecord =
         _asStringDynamicMap(snapshots[0]?.value) ?? <String, dynamic>{};
-    final activeRideMarker = _asStringDynamicMap(snapshots[1]?.value);
+    final activeRideMarker = null;
     final remoteOnline =
         _asBool(driverRecord['isOnline']) || _asBool(driverRecord['online']);
     final restoredCity = _normalizeCity(
@@ -3115,23 +3109,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     required String reason,
     required Map<String, Object?> data,
   }) async {
-    try {
-      await _driverActiveRideRef.child(driverId).set(data);
-    } catch (error, stackTrace) {
-      if (isRealtimeDatabasePermissionDenied(error)) {
-        _surfaceStartupPermissionDenied(
-          path: 'driver_active_ride/$driverId',
-          error: error,
-          stackTrace: stackTrace,
-          showDefaultState: false,
-        );
-        _log(
-          'driver_active_ride update skipped driverId=$driverId reason=$reason',
-        );
-        return;
-      }
-      rethrow;
-    }
+    _log(
+      '[MATCH_DEBUG][CANONICAL_RIDE_ONLY] skip driver_active_ride marker '
+      'driverId=$driverId reason=$reason keys=${data.keys.length}',
+    );
   }
 
   void _setStartingVoiceCall(bool value) {
@@ -3320,10 +3301,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     try {
       final snapshots = await Future.wait(<Future<rtdb.DataSnapshot>>[
         _driversRef.child(driverId).get(),
-        _driverActiveRideRef.child(driverId).get(),
       ]);
       final driverRecord = _asStringDynamicMap(snapshots[0].value);
-      final activeRideRecord = _asStringDynamicMap(snapshots[1].value);
+      final activeRideRecord = null;
       if (driverRecord == null) {
         _log(
           '[HEALTH] validation result=fail phase=$phase failed=driver_record_missing',
@@ -3421,11 +3401,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     final snapshots = await Future.wait(<Future<rtdb.DataSnapshot>>[
       _driversRef.child(driverId).get(),
-      _driverActiveRideRef.child(driverId).get(),
     ]);
 
     final driverRecord = _asStringDynamicMap(snapshots[0].value);
-    final activeRideRecord = _asStringDynamicMap(snapshots[1].value);
+    final activeRideRecord = null;
     if (driverRecord == null) {
       return 'driver_record_missing';
     }
@@ -6745,66 +6724,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     String? rideId,
     required String reason,
   }) async {
-    final driverId = _effectiveDriverId;
-    if (driverId.isEmpty) {
-      return;
-    }
-
-    final activeRideRef = _driverActiveRideRef.child(driverId);
-    var pausedDriverActiveListener = false;
-    try {
-      if (rideId == null || rideId.trim().isEmpty) {
-        _driverActiveRideId = null;
-        await activeRideRef.remove();
-        _log(
-            'driver_active_ride cleared driverId=$driverId rideId=unknown reason=$reason');
-        return;
-      }
-
-      if (_driverActiveRideSubscription != null) {
-        pausedDriverActiveListener = true;
-        _logRideReq(
-          '[MATCH_DEBUG][QUERY_PAUSE:driver_active_ride/$driverId] '
-          'clear_driver_active_ride_node_read',
-        );
-        await _driverActiveRideSubscription?.cancel();
-        _driverActiveRideSubscription = null;
-        await Future<void>.delayed(const Duration(milliseconds: 50));
-      }
-      _logRideReq(
-        '[MATCH_DEBUG][QUERY_GET:driver_active_ride/$driverId] clear_node_read',
-      );
-      final snapshot = await activeRideRef.get();
-      final activeRideData = _asStringDynamicMap(snapshot.value);
-      final activeRideId = _valueAsText(activeRideData?['ride_id']);
-      if (activeRideId.isEmpty || activeRideId == rideId) {
-        _driverActiveRideId = null;
-        await activeRideRef.remove();
-        _log(
-            'driver_active_ride cleared driverId=$driverId rideId=$rideId reason=$reason');
-      }
-    } catch (error, stackTrace) {
-      if (isRealtimeDatabasePermissionDenied(error)) {
-        _surfaceStartupPermissionDenied(
-          path: 'driver_active_ride/$driverId',
-          error: error,
-          stackTrace: stackTrace,
-          showDefaultState: false,
-        );
-        _log(
-          'driver_active_ride clear skipped driverId=$driverId rideId=${rideId ?? 'unknown'} reason=$reason',
-        );
-        return;
-      }
-      rethrow;
-    } finally {
-      if (pausedDriverActiveListener &&
-          driverId.isNotEmpty &&
-          _isOnline &&
-          _onlineSessionStartedAt > 0) {
-        await _startDriverActiveRideListener();
-      }
-    }
+    _driverActiveRideId = null;
+    _logRideReq(
+      '[MATCH_DEBUG][CANONICAL_RIDE_ONLY] skip driver_active_ride clear '
+      'rideId=${rideId ?? 'unknown'} reason=$reason',
+    );
   }
 
   Future<void> _commitRideAndDriverState({
@@ -6827,19 +6751,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       primaryUpdates['drivers/$driverId/$key'] = value;
     });
 
-    final secondaryUpdates = <String, Object?>{};
-    if (clearActiveRide) {
-      secondaryUpdates['driver_active_ride/$driverId'] = null;
-    } else if (activeRideUpdates != null) {
-      activeRideUpdates.forEach((key, value) {
-        secondaryUpdates['driver_active_ride/$driverId/$key'] = value;
-      });
-    }
-
     _logRtdb(
       'multi-path update start rideId=$rideId rideKeys=${rideUpdates.keys.length} '
       'driverKeys=${driverUpdates.keys.length} '
-      'secondaryKeys=${secondaryUpdates.length} clearActiveRide=$clearActiveRide',
+      'secondaryKeys=0 clearActiveRide=$clearActiveRide canonical_only=true',
     );
     try {
       await rtdb.FirebaseDatabase.instance.ref().update(primaryUpdates);
@@ -6854,25 +6769,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       rethrow;
     }
 
-    if (secondaryUpdates.isEmpty) {
-      return;
-    }
-
-    final secondaryOk = await runOptionalRealtimeDatabaseWrite(
-      source: 'driver_map.commit_driver_active_ride',
-      path: 'driver_active_ride/$driverId',
-      operation: clearActiveRide ? 'clear' : 'merge',
-      rideId: rideId,
-      action: () =>
-          rtdb.FirebaseDatabase.instance.ref().update(secondaryUpdates),
-    );
-    if (!secondaryOk) {
+    if (clearActiveRide || activeRideUpdates != null) {
       _logRtdb(
-        'driver_active_ride phase skipped (optional write denied) rideId=$rideId '
-        'driverId=$driverId clearActiveRide=$clearActiveRide',
+        '[MATCH_DEBUG][CANONICAL_RIDE_ONLY] skipped legacy driver_active_ride '
+        'rideId=$rideId clearActiveRide=$clearActiveRide',
       );
-    } else {
-      _logRtdb('multi-path secondary driver_active_ride success rideId=$rideId');
     }
   }
 
@@ -6939,23 +6840,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         rideId: rideId,
         action: () =>
             rtdb.FirebaseDatabase.instance.ref().update(latestTripPaths),
-      ),
-    );
-
-    final secondaryUpdates = <String, Object?>{
-      'driver_active_ride/$driverId/ride_id': rideId,
-      'driver_active_ride/$driverId/status': committedStatus,
-      'driver_active_ride/$driverId/trip_state': committedCanonicalForCommit,
-      'driver_active_ride/$driverId/updated_at': rtdb.ServerValue.timestamp,
-    };
-    unawaited(
-      runOptionalRealtimeDatabaseWrite(
-        source: 'driver_map.post_accept_driver_active_ride',
-        path: 'driver_active_ride/$driverId',
-        operation: 'merge',
-        rideId: rideId,
-        action: () =>
-            rtdb.FirebaseDatabase.instance.ref().update(secondaryUpdates),
       ),
     );
 
@@ -7374,162 +7258,32 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
   Future<void> _startDriverActiveRideListener() async {
     final driverId = _effectiveDriverId;
+    await _driverActiveRideSubscription?.cancel();
+    _driverActiveRideSubscription = null;
     if (driverId.isEmpty || !_isOnline || _onlineSessionStartedAt <= 0) {
-      await _driverActiveRideSubscription?.cancel();
-      _driverActiveRideSubscription = null;
       return;
     }
-
-    await _driverActiveRideSubscription?.cancel();
     _logRideReq(
-      '[MATCH_DEBUG][QUERY_ATTACH:driver_active_ride/$driverId] onValue',
+      '[MATCH_DEBUG][CANONICAL_RIDE_ONLY] driver_active_ride listener disabled driverId=$driverId',
     );
-    _driverActiveRideSubscription =
-        _driverActiveRideRef.child(driverId).onValue.listen(
-      (event) async {
-        try {
-          final activeRideData = _asStringDynamicMap(event.snapshot.value);
-          if (activeRideData == null) {
-            final driverSnapshot = await _driversRef.child(driverId).get();
-            final recoveredRide = await _recoverDriverRideFromBackend(
-              driverId: driverId,
-              driverRecord: _asStringDynamicMap(driverSnapshot.value) ??
-                  <String, dynamic>{},
-              activeRideMarker: null,
-            );
-            if (recoveredRide != null) {
-              _driverActiveRideId = recoveredRide.rideId;
-              await _listenToActiveRide(recoveredRide.rideId);
-              return;
-            }
-            final hadActiveTripUiState = _hasActiveTripUiState();
-            _driverActiveRideId = null;
-            _stopActiveRideListener();
-            if (!hadActiveTripUiState) {
-              return;
-            }
-
-            await _clearActiveRideState(
-              reason: 'driver_active_ride_missing',
-              resetTripState: true,
-            );
-            return;
-          }
-
-          final rideId = _valueAsText(activeRideData['ride_id']);
-          final status = TripStateMachine.legacyStatusForCanonical(
-            TripStateMachine.canonicalStateFromValues(
-              tripState: activeRideData['trip_state'],
-              status: activeRideData['status'],
-              assignedDriverId: activeRideData['driver_id'],
-            ),
-          );
-
-          if (!_isValidRideId(rideId)) {
-            _logInvalidRideBlocked(
-              rideId: 'driver_active_ride_missing_ride_id',
-              reason: 'driver_active_ride_missing_ride_id',
-            );
-            await _clearDriverActiveRideNode(
-              rideId: _driverActiveRideId,
-              reason: 'driver_active_ride_missing_ride_id',
-            );
-            await _clearActiveRideState(
-              reason: 'driver_active_ride_missing_ride_id',
-              resetTripState: true,
-            );
-            return;
-          }
-
-          if (status == 'pending_driver_action') {
-            if (!_isOnline) {
-              _log(
-                'pending driver acceptance suppressed because driver is offline rideId=$rideId',
-              );
-              return;
-            }
-            final rideSnapshot = await _rideRequestChildGetIosSafe(
-              rideId,
-              'driver_active_ride_pending_fetch',
-            );
-            final rideData = _asStringDynamicMap(rideSnapshot.value);
-            if (rideData == null) {
-              await _clearDriverActiveRideNode(
-                rideId: rideId,
-                reason: 'pending_driver_acceptance_missing_ride',
-              );
-              return;
-            }
-
-            final assignedDriverId = _valueAsText(rideData['driver_id']);
-            if (assignedDriverId != _effectiveDriverId) {
-              await _clearDriverActiveRideNode(
-                rideId: rideId,
-                reason: 'pending_driver_acceptance_driver_mismatch',
-              );
-              return;
-            }
-
-            final canonicalState = TripStateMachine.canonicalStateFromSnapshot(
-              rideData,
-            );
-            if (!TripStateMachine.isPendingDriverAssignmentState(
-                canonicalState)) {
-              await _clearDriverActiveRideNode(
-                rideId: rideId,
-                reason: 'pending_driver_acceptance_state_invalid',
-              );
-              return;
-            }
-
-            if (_assignmentHasExpired(rideData)) {
-              await _releaseAssignedRideIfNeeded(
-                rideId: rideId,
-                reason: 'assignment_expired',
-              );
-              return;
-            }
-
-            _syncPendingRidePreviewLocalState(
-              rideId: rideId,
-              rideData: rideData,
-            );
-            _logRideReq(
-              '[MATCH_DEBUG][POPUP_SUPPRESSED_PENDING_STATE] rideId=$rideId '
-              'source=driver_active_ride_listener_pending',
-            );
-            return;
-          }
-
-          if (!_isDriverActiveRideStatus(status)) {
-            _logInvalidRideBlocked(
-              rideId: rideId,
-              reason: 'driver_active_ride_status_invalid',
-            );
-            await _clearDriverActiveRideNode(
-              rideId: rideId,
-              reason: 'driver_active_ride_status_invalid',
-            );
-            await _clearActiveRideState(
-              reason: 'driver_active_ride_status_invalid',
-              resetTripState: true,
-            );
-            return;
-          }
-
-          _driverActiveRideId = rideId;
-          await _listenToActiveRide(rideId);
-        } catch (error) {
-          _log(
-            'driver active ride snapshot handling failed driverId=$driverId error=$error',
-          );
-        }
-      },
-      onError: (Object error) {
-        _log(
-            'driver active ride listener error driverId=$driverId error=$error');
-      },
-    );
+    try {
+      final driverSnapshot = await _driversRef.child(driverId).get();
+      final recoveredRide = await _recoverDriverRideFromBackend(
+        driverId: driverId,
+        driverRecord:
+            _asStringDynamicMap(driverSnapshot.value) ?? <String, dynamic>{},
+        activeRideMarker: null,
+      );
+      if (recoveredRide != null) {
+        _driverActiveRideId = recoveredRide.rideId;
+        await _listenToActiveRide(recoveredRide.rideId);
+      }
+    } catch (error) {
+      _log(
+        '[MATCH_DEBUG][CANONICAL_RIDE_ONLY] active ride recovery failed '
+        'driverId=$driverId error=$error',
+      );
+    }
   }
 
   void _clearInvalidRideUiState() {
@@ -7916,6 +7670,34 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     return _rideRequestsRef.root.child(canonicalRideChatMessagesPath(rideId));
   }
 
+  Future<void> _ensureRideChatInitialized({
+    required String rideId,
+    required Map<String, dynamic> rideData,
+  }) async {
+    final normalizedRideId = rideId.trim();
+    if (normalizedRideId.isEmpty) {
+      return;
+    }
+    final riderId = _valueAsText(rideData['rider_id']);
+    final driverId = _valueAsText(rideData['driver_id']);
+    final status = TripStateMachine.uiStatusFromSnapshot(rideData);
+    final now = rtdb.ServerValue.timestamp;
+    _log(
+      '[CHAT_INIT] rideId=$normalizedRideId rider_id=$riderId '
+      'driver_id=$driverId status=$status',
+    );
+    await _rideRequestsRef.root.update(<String, dynamic>{
+      'ride_chats/$normalizedRideId/ride_id': normalizedRideId,
+      'ride_chats/$normalizedRideId/rider_id': riderId,
+      'ride_chats/$normalizedRideId/driver_id': driverId,
+      'ride_chats/$normalizedRideId/status': status,
+      'ride_chats/$normalizedRideId/updated_at': now,
+      'ride_chats/$normalizedRideId/created_at': now,
+      'ride_requests/$normalizedRideId/chat_ready': true,
+      'ride_requests/$normalizedRideId/chat_ready_at': now,
+    });
+  }
+
   Future<void> _mirrorDriverChatToTripRouteLog({
     required String rideId,
     required String messageId,
@@ -8136,11 +7918,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     _lastDriverChatErrorNoticeKey = issueKey;
+    if (error != null && isRealtimeDatabasePermissionDenied(error)) {
+      _log('[CHAT_PERMISSION_DENIED] rideId=$rideId message=$message error=$error');
+    }
     if (_isDriverChatSessionActive(rideId)) {
       _showSnackBarSafely(
         const SnackBar(
-          content: Text(
-              'Chat is temporarily unavailable. Your trip is still active.'),
+          content: Text('Chat is syncing. Please retry in a moment.'),
         ),
       );
     }
@@ -8243,7 +8027,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _loggedDriverChatMessageIds.clear();
     _driverChatMessages.value = const <RideChatMessage>[];
     _driverChatMessagesById.clear();
-    _log('driver chat child listeners attached rideId=$rideId');
+    _log(
+      '[CHAT_SUBSCRIBE] role=driver rideId=$rideId '
+      'path=${canonicalRideChatMessagesPath(rideId)}',
+    );
 
     final ref = _rideChatMessagesRef(rideId);
     _driverChatSubscriptions.add(
@@ -11499,6 +11286,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       try {
         _applyRideLocationsFromData(validatedCommittedRideData);
         _evaluateArrivedAvailability();
+        await _ensureRideChatInitialized(
+          rideId: rideId,
+          rideData: validatedCommittedRideData,
+        );
         _loggedDriverChatMessageIds.clear();
         _startDriverChatListener(rideId);
         unawaited(
@@ -13201,6 +12992,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         );
         if (error is TimeoutException) {
           return 'Sending this message took too long. Please try again.';
+        }
+        if (isRealtimeDatabasePermissionDenied(error)) {
+          _log(
+            '[CHAT_PERMISSION_DENIED] rideId=$normalizedRideId '
+            'path=${canonicalRideChatMessagesPath(normalizedRideId)}/$messageId '
+            'error=$error',
+          );
         }
         return isRealtimeDatabasePermissionDenied(error)
             ? 'Chat permission was denied for this ride.'
