@@ -16,6 +16,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../config/driver_app_config.dart';
+import '../config/rtdb_ride_request_contract.dart';
 import '../services/call_permissions.dart';
 import '../services/call_service.dart';
 import '../services/dispatch_photo_upload_service.dart';
