@@ -210,6 +210,22 @@
             ".write": "auth != null"
           }
         },
+        "payment_methods": {
+          "$methodId": {
+            ".read": "auth != null && auth.uid === $uid",
+            ".write": "auth != null && auth.uid === $uid"
+          }
+        },
+        "verification": {
+          ".read": "auth != null && auth.uid === $uid",
+          ".write": "auth != null && auth.uid === $uid"
+        },
+        "trip_history": {
+          "$tripId": {
+            ".read": "auth != null && auth.uid === $uid",
+            ".write": "auth != null && auth.uid === $uid"
+          }
+        },
         "$userField": {
           ".read": "auth != null",
           ".write": "auth != null && auth.uid === $uid"

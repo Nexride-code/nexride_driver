@@ -7754,12 +7754,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _driverChatMessagesById[id] = RideChatMessage(
       id: id,
       rideId: r,
+      messageId: id,
       senderId: senderId,
       senderRole: 'driver',
+      type: 'text',
       text: text,
+      imageUrl: '',
       createdAt: clientCreatedAt,
       status: 'sent',
       isRead: false,
+      localTempId: id,
     );
     _flushDriverChatMessageTable(r);
   }
@@ -7782,12 +7786,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _driverChatMessagesById[id] = RideChatMessage(
       id: id,
       rideId: r,
+      messageId: id,
       senderId: senderId,
       senderRole: 'driver',
+      type: 'text',
       text: text.isNotEmpty ? text : existing.text,
+      imageUrl: existing.imageUrl,
       createdAt: existing.createdAt,
       status: 'failed',
       isRead: false,
+      localTempId: existing.localTempId,
     );
     _flushDriverChatMessageTable(r);
   }
@@ -12951,12 +12959,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       final optimistic = RideChatMessage(
         id: messageId,
         rideId: normalizedRideId,
+        messageId: messageId,
         senderId: senderId,
         senderRole: 'driver',
+        type: 'text',
         text: trimmed,
+        imageUrl: '',
         createdAt: clientCreatedAt,
         status: 'sending',
         isRead: false,
+        localTempId: messageId,
       );
       if (_driverChatListenerRideId == normalizedRideId) {
         _driverChatMessagesById[messageId] = optimistic;
@@ -12965,10 +12977,14 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
       final payload = <String, dynamic>{
         'id': messageId,
+        'message_id': messageId,
         'ride_id': normalizedRideId,
         'sender_id': senderId,
         'sender_role': 'driver',
+        'type': 'text',
         'text': trimmed,
+        'image_url': '',
+        'local_temp_id': messageId,
         'created_at': rtdb.ServerValue.timestamp,
         'created_at_client': clientCreatedAt,
         'status': 'sent',
@@ -12984,7 +13000,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'created_at_client': clientCreatedAt,
       };
       _log(
-        'message send start rideId=$normalizedRideId messageId=$messageId path=${canonicalRideChatMessagesPath(normalizedRideId)}/$messageId',
+        '[CHAT_SEND_START] role=driver rideId=$normalizedRideId '
+        'messageId=$messageId path=${canonicalRideChatMessagesPath(normalizedRideId)}/$messageId',
       );
       try {
         await rootRef.update(<String, dynamic>{
@@ -13020,7 +13037,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         ));
 
         _log(
-          'message send success rideId=$normalizedRideId messageId=$messageId path=${canonicalRideChatMessagesPath(normalizedRideId)}/$messageId',
+          '[CHAT_SEND_OK] role=driver rideId=$normalizedRideId '
+          'messageId=$messageId path=${canonicalRideChatMessagesPath(normalizedRideId)}/$messageId',
         );
         return null;
       } catch (error) {
@@ -13031,7 +13049,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           text: trimmed,
         );
         _log(
-          'message send failure rideId=$normalizedRideId messageId=$messageId error=$error',
+          '[CHAT_SEND_FAIL] role=driver rideId=$normalizedRideId '
+          'messageId=$messageId error=$error',
         );
         if (error is TimeoutException) {
           return 'Sending this message took too long. Please try again.';
