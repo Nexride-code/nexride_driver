@@ -2635,6 +2635,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     return DriverLaunchScope.normalizeSupportedCity(city?.toString());
   }
 
+  String? _normalizeRideMarket(dynamic rawMarket) {
+    return normalizeRideMarketSlug(rawMarket) ?? _normalizeCity(rawMarket);
+  }
+
   /// Canonical market for ride request queries and popup eligibility.
   /// Uses GPS/profile [_driverCity] when set; otherwise the selected launch city
   /// so dispatch stays aligned if resolution lags briefly after startup.
@@ -2832,7 +2836,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
   String? _rideMarketFromData(Map<String, dynamic>? rideData) {
     final serviceArea = _asStringDynamicMap(rideData?['service_area']);
-    return _normalizeCity(
+    return _normalizeRideMarket(
       rideData?['market_pool'] ??
           rideData?['market'] ??
           serviceArea?['market'] ??
@@ -5739,6 +5743,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
   LatLng? _destinationLatLngFromRideData(Map<String, dynamic> rideData) {
     return _latLngFromMap(rideData['destination']) ??
+        _latLngFromMap(rideData['dropoff']) ??
         _latLngFromMap(rideData['final_destination']);
   }
 
@@ -5779,6 +5784,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final destinationAddress = _valueAsText(rideData['destination_address']);
     if (destinationAddress.isNotEmpty) {
       return destinationAddress;
+    }
+
+    final dropoffAddress = _valueAsText(rideData['dropoff_address']);
+    if (dropoffAddress.isNotEmpty) {
+      return dropoffAddress;
     }
 
     return _valueAsText(rideData['final_destination_address']);
@@ -9204,6 +9214,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _logRideReq(
       'driver market resolved=$driverCity query=ride_requests orderByChild=market_pool equalTo=$driverCity',
     );
+    _logRideReq(
+      '[DRIVER_DISCOVERY_QUERY] path=ride_requests '
+      'orderByChild=market_pool equalTo=$driverCity',
+    );
     _log(
       'listener attached path=ride_requests[orderByChild=market_pool,equalTo=$driverCity] online_session_started_at=$_onlineSessionStartedAt reason=$reason',
     );
@@ -9268,6 +9282,26 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           final status = rideData == null
               ? 'payload_not_map'
               : TripStateMachine.uiStatusFromSnapshot(rideData);
+          if (rideData != null) {
+            _logRideReq(
+              '[RIDER_WRITE] observed rideId=$rideId '
+              'market=${_rideMarketFromData(rideData) ?? 'missing'} '
+              'status=${_valueAsText(rideData[RtdbRideRequestFields.status])} '
+              'trip_state=${_valueAsText(rideData[RtdbRideRequestFields.tripState])} '
+              'driver_id=${_valueAsText(rideData[RtdbRideRequestFields.driverId])} '
+              'created_at=${_parseCreatedAt(rideData[RtdbRideRequestFields.createdAt])} '
+              'expires_at=${_rideExpiryTimestamp(rideData)}',
+            );
+            _logRideReq(
+              '[DRIVER_DISCOVERY_CANDIDATE] rideId=$rideId '
+              'market=${_rideMarketFromData(rideData) ?? 'missing'} '
+              'status=${_valueAsText(rideData[RtdbRideRequestFields.status])} '
+              'trip_state=${_valueAsText(rideData[RtdbRideRequestFields.tripState])} '
+              'driver_id=${_valueAsText(rideData[RtdbRideRequestFields.driverId])} '
+              'created_at=${_parseCreatedAt(rideData[RtdbRideRequestFields.createdAt])} '
+              'expires_at=${_rideExpiryTimestamp(rideData)}',
+            );
+          }
           final skipReason = rideData == null
               ? 'payload_not_map'
               : _popupServerSkipReason(
@@ -9281,6 +9315,14 @@ class _DriverMapScreenState extends State<DriverMapScreen>
                 _serviceTypeKey(rideData['service_type']),
               ) &&
               skipReason.isEmpty;
+          if (!qualifies) {
+            _logRideReq(
+              '[DRIVER_DISCOVERY_REJECT] rideId=$rideId reason='
+              '${skipReason.isEmpty ? 'service_type_not_active' : skipReason}',
+            );
+          } else {
+            _logRideReq('[DRIVER_DISCOVERY_ACCEPT] rideId=$rideId');
+          }
           _logRideReq(
             'ride discovery evaluation rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason} source=$source',
           );

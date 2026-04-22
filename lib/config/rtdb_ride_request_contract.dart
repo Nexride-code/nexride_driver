@@ -33,3 +33,66 @@ abstract final class RtdbRideRequestFields {
   static const cancelReason = 'cancel_reason';
   static const expiresAt = 'expires_at';
 }
+
+/// Canonical market slug for ride request write/read alignment.
+/// Rules:
+/// - trim
+/// - lowercase
+/// - collapse punctuation/spaces
+/// - map known city aliases to a stable slug
+String? normalizeRideMarketSlug(dynamic rawMarket) {
+  final raw = rawMarket?.toString().trim().toLowerCase() ?? '';
+  if (raw.isEmpty) {
+    return null;
+  }
+
+  final spaced = raw
+      .replaceAll(RegExp(r'[^a-z0-9]'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+  if (spaced.isEmpty) {
+    return null;
+  }
+
+  bool hasAny(List<String> tokens) {
+    for (final token in tokens) {
+      if (spaced.contains(token)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (hasAny(const <String>[
+    'lagos',
+    'ikeja',
+    'yaba',
+    'lekki',
+    'ajah',
+    'surulere',
+    'ikoyi',
+    'victoria island',
+  ])) {
+    return 'lagos';
+  }
+  if (hasAny(const <String>[
+    'abuja',
+    'fct',
+    'federal capital territory',
+    'wuse',
+    'garki',
+    'maitama',
+    'asokoro',
+  ])) {
+    return 'abuja';
+  }
+  if (hasAny(const <String>['delta', 'asaba', 'warri', 'effurun'])) {
+    return 'delta';
+  }
+  if (hasAny(const <String>['anambra', 'awka', 'onitsha', 'nnewi'])) {
+    return 'anambra';
+  }
+
+  // Fallback keeps a stable slug shape for unknown cities.
+  return spaced.replaceAll(' ', '_');
+}
