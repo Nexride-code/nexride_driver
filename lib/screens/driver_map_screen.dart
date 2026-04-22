@@ -296,6 +296,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   final Map<String, RideChatMessage> _driverChatMessagesById =
       <String, RideChatMessage>{};
   bool _driverChatSendInFlight = false;
+  final Map<String, String> _driverChatDraftByRide = <String, String>{};
   StreamSubscription<rtdb.DatabaseEvent>? _callSubscription;
   StreamSubscription<rtdb.DatabaseEvent>? _incomingCallSubscription;
   Timer? _ridePopupTimer;
@@ -8012,13 +8013,15 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     _log(
-      'driver chat unread updated rideId=$rideId unreadCount=$unreadCount chatOpen=$_isDriverChatOpen',
+      '[CHAT_UNREAD_INC] role=driver rideId=$rideId uid=$_effectiveDriverId unreadCount=$unreadCount',
     );
   }
 
   void _resetDriverUnreadCount(String rideId) {
     _updateDriverUnreadCount(rideId, 0);
-    _log('driver chat unread reset rideId=$rideId unreadCount=0');
+    _log(
+      '[CHAT_UNREAD_CLEAR] role=driver rideId=$rideId uid=$_effectiveDriverId unreadCount=0',
+    );
   }
 
   void _resetDriverChatState({bool stopListener = true}) {
@@ -8063,7 +8066,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _driverChatMessages.value = const <RideChatMessage>[];
     _driverChatMessagesById.clear();
     _log(
-      '[CHAT_SUBSCRIBE] role=driver rideId=$rideId '
+      '[CHAT_ATTACH] role=driver rideId=$rideId '
       'path=${canonicalRideChatMessagesPath(rideId)}',
     );
 
@@ -13007,6 +13010,32 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   }
 
   Future<String?> _sendDriverChatMessage(String rideId, String text) async {
+    return _sendDriverChatMessageInternal(rideId: rideId, text: text);
+  }
+
+  Future<String?> _retryDriverChatMessage(
+    String rideId,
+    RideChatMessage message,
+  ) async {
+    _log(
+      '[CHAT_RETRY] role=driver rideId=$rideId uid=$_effectiveDriverId messageId=${message.id}',
+    );
+    return _sendDriverChatMessageInternal(
+      rideId: rideId,
+      text: message.text,
+      imageUrl: message.imageUrl,
+      retryMessageId: message.id,
+      retryType: message.type,
+    );
+  }
+
+  Future<String?> _sendDriverChatMessageInternal({
+    required String rideId,
+    required String text,
+    String imageUrl = '',
+    String? retryMessageId,
+    String retryType = 'text',
+  }) async {
     final senderId = _effectiveDriverId;
     if (senderId.isEmpty) {
       _log('message send blocked rideId=$rideId reason=missing_driver_id');
@@ -13014,7 +13043,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     final trimmed = text.trim();
-    if (trimmed.isEmpty) {
+    final normalizedImageUrl = imageUrl.trim();
+    if (trimmed.isEmpty && normalizedImageUrl.isEmpty) {
       return null;
     }
 
@@ -13028,8 +13058,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     final normalizedRideId = rideId.trim();
     final rootRef = _rideRequestsRef.root;
-    final messageRef = _rideChatMessagesRef(normalizedRideId).push();
-    final messageId = messageRef.key?.trim() ?? '';
+    final messageId = retryMessageId?.trim().isNotEmpty == true
+        ? retryMessageId!.trim()
+        : (_rideChatMessagesRef(normalizedRideId).push().key?.trim() ?? '');
     if (messageId.isEmpty) {
       return 'Unable to start this chat message right now.';
     }
@@ -13042,15 +13073,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
 
       final clientCreatedAt = DateTime.now().millisecondsSinceEpoch;
+      final messageType = normalizedImageUrl.isNotEmpty ? 'image' : retryType;
       final optimistic = RideChatMessage(
         id: messageId,
         rideId: normalizedRideId,
         messageId: messageId,
         senderId: senderId,
         senderRole: 'driver',
-        type: 'text',
+        type: messageType,
         text: trimmed,
-        imageUrl: '',
+        imageUrl: normalizedImageUrl,
         createdAt: clientCreatedAt,
         status: 'sending',
         isRead: false,
@@ -13067,9 +13099,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'ride_id': normalizedRideId,
         'sender_id': senderId,
         'sender_role': 'driver',
-        'type': 'text',
+        'type': messageType,
         'text': trimmed,
-        'image_url': '',
+        'image_url': normalizedImageUrl,
         'local_temp_id': messageId,
         'created_at': rtdb.ServerValue.timestamp,
         'created_at_client': clientCreatedAt,
@@ -13083,7 +13115,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'ride_id': normalizedRideId,
         'sender_id': senderId,
         'sender_role': 'driver',
-        'text': _driverChatPreview(trimmed),
+        'text': _driverChatPreview(trimmed.isEmpty ? 'Photo' : trimmed),
         'created_at': rtdb.ServerValue.timestamp,
         'created_at_client': clientCreatedAt,
       };
@@ -13175,6 +13207,83 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
   }
 
+  Future<String?> _sendDriverChatImage(
+    String rideId,
+    DriverRideChatImageSource source,
+  ) async {
+    final senderId = _effectiveDriverId;
+    if (senderId.isEmpty) {
+      return 'Driver account is not available.';
+    }
+    final normalizedRideId = rideId.trim();
+    final useCamera = source == DriverRideChatImageSource.camera;
+    _log(
+      '[CHAT_IMAGE_PICK] role=driver rideId=$normalizedRideId uid=$senderId source=${useCamera ? 'camera' : 'gallery'}',
+    );
+    if (useCamera) {
+      final cameraPermission = await Permission.camera.request();
+      if (!cameraPermission.isGranted) {
+        return 'Camera permission is required to take a photo.';
+      }
+    }
+    final picked = await _dispatchPhotoPicker.pickImage(
+      source: useCamera ? ImageSource.camera : ImageSource.gallery,
+      maxWidth: 1600,
+      imageQuality: 86,
+    );
+    if (picked == null) {
+      return null;
+    }
+    _log(
+      '[CHAT_IMAGE_UPLOAD_START] role=driver rideId=$normalizedRideId uid=$senderId',
+    );
+    try {
+      final participantKey = _chatParticipantKey(senderId, _currentRiderIdForRide);
+      final uploaded = await _dispatchPhotoUploadService.uploadRideChatPhoto(
+        rideId: normalizedRideId,
+        actorId: senderId,
+        participantKey: participantKey,
+        asset: DispatchPhotoSelectedAsset(
+          localPath: picked.path,
+          fileName: picked.name.isNotEmpty
+              ? picked.name
+              : picked.path.split('/').last,
+          mimeType: picked.path.toLowerCase().endsWith('.png')
+              ? 'image/png'
+              : 'image/jpeg',
+          fileSizeBytes: await picked.length(),
+          source: useCamera ? 'camera' : 'gallery',
+        ),
+      );
+      final result = await _sendDriverChatMessageInternal(
+        rideId: normalizedRideId,
+        text: '',
+        imageUrl: uploaded.fileUrl,
+        retryType: 'image',
+      );
+      if (result == null) {
+        _log(
+          '[CHAT_IMAGE_UPLOAD_OK] role=driver rideId=$normalizedRideId uid=$senderId',
+        );
+      } else {
+        _log(
+          '[CHAT_IMAGE_UPLOAD_FAIL] role=driver rideId=$normalizedRideId uid=$senderId error=$result',
+        );
+      }
+      return result;
+    } catch (error) {
+      _log(
+        '[CHAT_IMAGE_UPLOAD_FAIL] role=driver rideId=$normalizedRideId uid=$senderId error=$error',
+      );
+      return 'Unable to send this image right now.';
+    }
+  }
+
+  String _chatParticipantKey(String first, String second) {
+    final ids = <String>[first.trim(), second.trim()]..sort();
+    return ids.join('_');
+  }
+
   void _openDriverChat() {
     final rideId = _activeDriverRideContextId;
     if (rideId == null || !_canOpenChat) {
@@ -13214,6 +13323,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           currentUserId: _effectiveDriverId,
           messagesListenable: _driverChatMessages,
           onSendMessage: _sendDriverChatMessage,
+          onRetryMessage: _retryDriverChatMessage,
+          onSendImage: _sendDriverChatImage,
+          initialDraft: _driverChatDraftByRide[rideId] ?? '',
+          onDraftChanged: (value) {
+            _driverChatDraftByRide[rideId] = value;
+          },
           onStartVoiceCall: _showRideCallButton
               ? () {
                   unawaited(_startVoiceCallFromChat());
@@ -13226,6 +13341,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       },
     ).whenComplete(() {
       _isDriverChatOpen = false;
+      _driverChatDraftByRide.removeWhere((key, _) => key != rideId);
     });
   }
 
