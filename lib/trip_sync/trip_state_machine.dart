@@ -75,6 +75,9 @@ class TripStateMachine {
     },
     TripLifecycleState.searchingDriver: <String>{
       TripLifecycleState.pendingDriverAction,
+      // Atomic driver accept from open pool (no pre-reserve): one RTDB transaction
+      // assigns the driver and lands on driver_accepted.
+      TripLifecycleState.driverAccepted,
       TripLifecycleState.tripCancelled,
     },
     TripLifecycleState.pendingDriverAction: <String>{

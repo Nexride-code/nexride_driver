@@ -46,7 +46,8 @@ class DriverLaunchMarket {
 
 class DriverServiceAreaConfig {
   // Launch markets must stay aligned with RiderServiceAreaConfig.launchMarkets
-  // (lib/config/rider_app_config.dart) so ride_requests.market matches driver queries.
+  // (rider `lib/config/rider_app_config.dart`) so `ride_requests.market_pool` matches
+  // driver discovery (`orderByChild('market_pool').equalTo(citySlug)`).
 
   static const String countryCode = 'NG';
   static const String countryName = 'Nigeria';

@@ -2839,7 +2839,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   String? _rideMarketFromData(Map<String, dynamic>? rideData) {
     final serviceArea = _asStringDynamicMap(rideData?['service_area']);
     return _normalizeCity(
-      rideData?['market'] ??
+      rideData?['market_pool'] ??
+          rideData?['market'] ??
           serviceArea?['market'] ??
           rideData?['launch_market_city'] ??
           rideData?['city'],
@@ -5986,6 +5987,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
   bool _isRideClaimableForDriverAccept(Map<String, dynamic> rideData) {
     final canonicalState = TripStateMachine.canonicalStateFromSnapshot(rideData);
+    if (TripStateMachine.isPendingDriverAssignmentState(canonicalState)) {
+      final assignedDriver = _valueAsText(rideData['driver_id']);
+      return assignedDriver == _effectiveDriverId &&
+          !_assignmentHasExpired(rideData);
+    }
+
     if (!_isCanonicalOpenForClaim(canonicalState)) {
       return false;
     }
@@ -6237,6 +6244,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logPopupServerSkip(rideId, rideData, 'missing_destination_coordinates');
       return 'missing_destination_coordinates';
     }
+
+    _logRideReq(
+      '[DRIVER_DISCOVERY] rideId=$rideId market=${_rideMarketFromData(rideData)} '
+      'trip_state=${rideData['trip_state']} status=${rideData['status']}',
+    );
 
     return null;
   }
@@ -6906,6 +6918,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     required String rideId,
     required String committedStatus,
     required String committedCanonicalForCommit,
+    required Map<String, dynamic> rideData,
   }) {
     final driverId = _effectiveDriverId;
     if (driverId.isEmpty) {
@@ -6943,6 +6956,59 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         rideId: rideId,
         action: () =>
             rtdb.FirebaseDatabase.instance.ref().update(secondaryUpdates),
+      ),
+    );
+
+    final riderId = _valueAsText(rideData['rider_id']);
+    final nowServer = rtdb.ServerValue.timestamp;
+    final opsUpdates = <String, Object?>{
+      'admin_rides/$rideId/summary/ride_id': rideId,
+      'admin_rides/$rideId/summary/rider_id': riderId,
+      'admin_rides/$rideId/summary/driver_id': driverId,
+      'admin_rides/$rideId/summary/market': _rideMarketFromData(rideData),
+      'admin_rides/$rideId/summary/status': committedStatus,
+      'admin_rides/$rideId/summary/trip_state': committedCanonicalForCommit,
+      'admin_rides/$rideId/summary/payment_method': _valueAsText(rideData['payment_method']),
+      'admin_rides/$rideId/summary/payment_status': _valueAsText(rideData['payment_status']),
+      'admin_rides/$rideId/summary/settlement_status': _valueAsText(rideData['settlement_status']).isEmpty
+          ? 'pending'
+          : _valueAsText(rideData['settlement_status']),
+      'admin_rides/$rideId/summary/support_status': _valueAsText(rideData['support_status']).isEmpty
+          ? 'normal'
+          : _valueAsText(rideData['support_status']),
+      'admin_rides/$rideId/summary/created_at': rideData['created_at'],
+      'admin_rides/$rideId/summary/accepted_at': rideData['accepted_at'] ?? nowServer,
+      'admin_rides/$rideId/summary/cancelled_at': rideData['cancelled_at'],
+      'admin_rides/$rideId/summary/completed_at': rideData['completed_at'],
+      'admin_rides/$rideId/summary/cancel_reason': _valueAsText(rideData['cancel_reason']),
+      'admin_rides/$rideId/summary/updated_at': nowServer,
+      'support_queue/$rideId/ride_id': rideId,
+      'support_queue/$rideId/rider_id': riderId,
+      'support_queue/$rideId/driver_id': driverId,
+      'support_queue/$rideId/status': committedStatus,
+      'support_queue/$rideId/trip_state': committedCanonicalForCommit,
+      'support_queue/$rideId/payment_status': _valueAsText(rideData['payment_status']),
+      'support_queue/$rideId/settlement_status': _valueAsText(rideData['settlement_status']).isEmpty
+          ? 'pending'
+          : _valueAsText(rideData['settlement_status']),
+      'support_queue/$rideId/support_status': _valueAsText(rideData['support_status']).isEmpty
+          ? 'normal'
+          : _valueAsText(rideData['support_status']),
+      'support_queue/$rideId/created_at': rideData['created_at'],
+      'support_queue/$rideId/accepted_at': rideData['accepted_at'] ?? nowServer,
+      'support_queue/$rideId/cancelled_at': rideData['cancelled_at'],
+      'support_queue/$rideId/completed_at': rideData['completed_at'],
+      'support_queue/$rideId/cancel_reason': _valueAsText(rideData['cancel_reason']),
+      'support_queue/$rideId/last_event': 'driver_accept',
+      'support_queue/$rideId/updated_at': nowServer,
+    };
+    unawaited(
+      runOptionalRealtimeDatabaseWrite(
+        source: 'driver_map.post_accept_ops_mirror',
+        path: 'admin_rides/$rideId/summary',
+        operation: 'merge',
+        rideId: rideId,
+        action: () => rtdb.FirebaseDatabase.instance.ref().update(opsUpdates),
       ),
     );
   }
@@ -7067,10 +7133,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             'car': car,
             'plate': plate,
             'status': _kPendingDriverAcceptanceStatus,
-            // Drop top-level [market] so this row leaves the open-pool index.
-            // Otherwise every other driver's [orderByChild=market] query fails
-            // RTDB security (they cannot read your pending assignment node).
+            // Drop open-pool index fields so other drivers' discovery queries stay valid.
             'market': null,
+            'market_pool': null,
             'driver_notified_at': rtdb.ServerValue.timestamp,
             'driver_matched_at': rtdb.ServerValue.timestamp,
             'matched_driver_id': driverId,
@@ -7236,8 +7301,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               'assignment_timeout_ms': null,
               'last_assignment_driver_id': driverId,
               'last_assignment_release_reason': reason,
-              if (reindexMarket != null && reindexMarket.isNotEmpty)
+              if (reindexMarket != null && reindexMarket.isNotEmpty) ...<String, dynamic>{
                 'market': reindexMarket,
+                'market_pool': reindexMarket,
+              },
             }),
         );
       }, applyLocally: false);
@@ -7493,7 +7560,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     await subscription?.cancel();
     if (hadListener) {
       _logRideReq(
-        '[MATCH_DEBUG][QUERY_DETACH:ride_requests?orderByChild=market&equalTo=${previousCity ?? 'none'}] '
+        '[MATCH_DEBUG][QUERY_DETACH:ride_requests?orderByChild=market_pool&equalTo=${previousCity ?? 'none'}] '
         'discovery reason=$reason',
       );
       _logRideReq(
@@ -9348,23 +9415,23 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     _logRideReq(
-      'driver market resolved=$driverCity query=ride_requests orderByChild=market equalTo=$driverCity',
+      'driver market resolved=$driverCity query=ride_requests orderByChild=market_pool equalTo=$driverCity',
     );
     _log(
-      'listener attached path=ride_requests[orderByChild=market,equalTo=$driverCity] online_session_started_at=$_onlineSessionStartedAt reason=$reason',
+      'listener attached path=ride_requests[orderByChild=market_pool,equalTo=$driverCity] online_session_started_at=$_onlineSessionStartedAt reason=$reason',
     );
     _logRtdb(
-      'listener attached path=ride_requests[orderByChild=market,equalTo=$driverCity]',
+      'listener attached path=ride_requests[orderByChild=market_pool,equalTo=$driverCity]',
     );
 
     debugPrint(
-      '[DISCOVERY_QUERY] queryField=market queryEqualTo=$driverCity '
+      '[DISCOVERY_QUERY] queryField=market_pool queryEqualTo=$driverCity '
       'effectiveDriverMarket=${_effectiveDriverMarket ?? 'null'} '
       'effectiveDriverCity=${_driverCity ?? 'null'} selectedLaunchCity=$_selectedLaunchCity',
     );
 
     final rideRequestsQuery =
-        _rideRequestsRef.orderByChild('market').equalTo(driverCity);
+        _rideRequestsRef.orderByChild('market_pool').equalTo(driverCity);
 
     String driverReqDatabaseUrl() {
       try {
@@ -9380,7 +9447,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _logDriverReq('databaseURL=$driverReqDbUrl');
     _logDriverReq('effectiveMarket=$driverCity');
     _logDriverReq(
-      'queryPath=ride_requests orderByChild=market equalTo=$driverCity',
+      'queryPath=ride_requests orderByChild=market_pool equalTo=$driverCity',
     );
 
     Future<void> snapshotProcessingChain = Future<void>.value();
@@ -9912,11 +9979,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'request listener STREAM subscribed market=$driverCity reason=$reason token=$listenerToken',
       );
       debugPrint(
-        '[RTDB_DISCOVERY] STREAM_SUBSCRIBE path=ride_requests?orderByChild=market&equalTo=$driverCity '
+        '[RTDB_DISCOVERY] STREAM_SUBSCRIBE path=ride_requests?orderByChild=market_pool&equalTo=$driverCity '
         'market=$driverCity authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'}',
       );
       _logRideReq(
-        '[MATCH_DEBUG][QUERY_ATTACH:ride_requests?orderByChild=market&equalTo=$driverCity] '
+        '[MATCH_DEBUG][QUERY_ATTACH:ride_requests?orderByChild=market_pool&equalTo=$driverCity] '
         'discovery onValue',
       );
       _rideRequestSubscription = rideRequestsQuery.onValue.listen(
@@ -9940,7 +10007,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           final message = _firebaseErrorMessage(error);
           _rideDiscoveryListenerHealthy = false;
           debugPrint(
-            '[RTDB_DISCOVERY] STREAM_ERROR path=ride_requests?orderByChild=market&equalTo=$driverCity '
+            '[RTDB_DISCOVERY] STREAM_ERROR path=ride_requests?orderByChild=market_pool&equalTo=$driverCity '
             'market=$driverCity authUid=$uid permissionDenied=$denied code=$code error=$message',
           );
           rtdbFlowLog(
@@ -11115,7 +11182,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         '[MATCH_DEBUG][ACCEPT_START] rideId=$rideId driverId=$_effectiveDriverId',
       );
       _logRideReq(
+        '[DRIVER_ACCEPT_START] rideId=$rideId driverId=$_effectiveDriverId',
+      );
+      _logRideReq(
         '[MATCH_DEBUG][ACCEPT_TX_BEGIN] rideId=$rideId driverId=$_effectiveDriverId',
+      );
+      _logRideReq(
+        '[DRIVER_ACCEPT_TX] stage=begin rideId=$rideId driverId=$_effectiveDriverId',
       );
       final transactionResult = await ref.runTransaction((currentData) {
         final current = _asStringDynamicMap(currentData);
@@ -11157,10 +11230,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               // Rider / legacy UIs (and Firestore-era clients) often key off this phrase.
               'rider_sync_status': 'driver_found',
               'driver_match_confirmed_at': rtdb.ServerValue.timestamp,
-              // Leave the open-market index; [service_area]/[city] still carry market.
+              // Leave the open-pool index; [service_area] / [city] still carry market.
               'market': null,
-              'status': 'accepted',
-              'trip_state': 'accepted',
+              'market_pool': null,
               'accepted_at': rtdb.ServerValue.timestamp,
               'assignment_expires_at': null,
               'driver_response_timeout_at': null,
@@ -11214,6 +11286,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           'rtdb_committed=${transactionResult.committed}',
         );
         _logRideReq(
+          '[DRIVER_ACCEPT_TX] stage=abort rideId=$rideId reason=$latestBlockedReason '
+          'committed=${transactionResult.committed}',
+        );
+        _logRideReq(
           '[MATCH_DEBUG][ACCEPT_LOCK_FAIL] rideId=$rideId reason=$latestBlockedReason '
           'committed=${transactionResult.committed}',
         );
@@ -11225,6 +11301,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _logRideReq(
           '[MATCH_DEBUG][ACCEPT_FAIL] rideId=$rideId reason=$latestBlockedReason '
           'phase=transaction',
+        );
+        _logRideReq(
+          '[DRIVER_ACCEPT_FAIL] rideId=$rideId reason=$latestBlockedReason phase=transaction',
         );
         _logCanonicalRideEvent(
           eventName: 'transaction_failed',
@@ -11308,6 +11387,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'idempotent=$acceptLockWasIdempotent rtdb_committed=${transactionResult.committed} '
         'trip_state=$committedCanonicalForCommit ui_status=$committedStatus',
       );
+      _logRideReq('[OPEN_POOL_REMOVE] rideId=$rideId market_pool=null source=accept_tx');
+      _logRideReq(
+        '[DRIVER_ACCEPT_TX] stage=commit rideId=$rideId driverId=$_effectiveDriverId '
+        'trip_state=$committedCanonicalForCommit ui_status=$committedStatus',
+      );
       _logCanonicalRideEvent(
         eventName: 'transaction_committed',
         rideId: rideId,
@@ -11360,12 +11444,17 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         rideId: rideId,
         committedStatus: committedStatus,
         committedCanonicalForCommit: committedCanonicalForCommit,
+        rideData: validatedCommittedRideData,
       );
 
       _logRideReq(
         '[MATCH_DEBUG][ACCEPT_SUCCESS] rideId=$rideId driverId=$_effectiveDriverId '
         'trip_state=$committedCanonicalForCommit ui_status=$committedStatus '
         'critical_rtdb_sync_ok=$criticalPostAcceptSyncOk',
+      );
+      _logRideReq(
+        '[DRIVER_ACCEPT_OK] rideId=$rideId driverId=$_effectiveDriverId '
+        'trip_state=$committedCanonicalForCommit ui_status=$committedStatus',
       );
       _logRideReq(
         '[MATCH_DEBUG][DRIVER_ACTIVE_TRIP] rideId=$rideId driverId=$_effectiveDriverId '
@@ -11487,6 +11576,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
       _logRideReq(
         '[MATCH_DEBUG][ACCEPT_FAIL] rideId=$rideId reason=exception '
+        'type=${error.runtimeType} phase=accept_try',
+      );
+      _logRideReq(
+        '[DRIVER_ACCEPT_FAIL] rideId=$rideId reason=exception '
         'type=${error.runtimeType} phase=accept_try',
       );
       _logRideReq(

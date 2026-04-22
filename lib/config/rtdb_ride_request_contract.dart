@@ -1,23 +1,35 @@
 /// Canonical Realtime Database field names for `ride_requests/{rideId}`.
-/// Rider and driver apps should use **snake_case** here for new writes.
-/// Rules also accept legacy `riderId` / `matchedDriverId` for reads and creates.
+/// Rider and driver apps use **snake_case** for all fields below.
+/// Rules also accept legacy `riderId` / `matchedDriverId` for creates and reads.
 ///
-/// **Discovery contract (driver `orderByChild('market').equalTo(city)`):**
-/// - Path: `ride_requests/{rideId}` (indexed field `market` on parent).
-/// - Required for visibility: non-empty string `market` matching driver launch city
-///   (e.g. `lagos`, `abuja`) — same slug as `DriverLaunchScope` / rider service area.
-/// - Open pool: `driver_id` must be absent, null, empty string, or `'waiting'`.
-/// - `status` / `trip_state` must be in the open-search allowlist used in
-///   `database.rules.json` (includes `searching`, `requested`, `matching`, `offered`,
-///   `pending_driver_acceptance`, etc.). Prefer `status: 'searching'` and
-///   `trip_state: 'searching_driver'` for new code.
-/// - Do **not** rely on camelCase `driverId` / `tripState` for security rules; use
-///   snake_case fields above so drivers can read the node in market queries.
+/// **Discovery (driver):** `orderByChild('market_pool').equalTo(citySlug)` only.
+/// - While a request is in the open pool, set [marketPool] to the same canonical
+///   slug as [market] (e.g. `lagos`). Clear [marketPool] (null) when a driver is
+///   reserved or the trip leaves the pool so other drivers’ queries are not denied.
+/// - Keep [market] for analytics / UI even when not indexed for discovery.
 abstract final class RtdbRideRequestFields {
+  static const rideId = 'ride_id';
   static const riderId = 'rider_id';
   static const driverId = 'driver_id';
   static const matchedDriverId = 'matched_driver_id';
   static const market = 'market';
+  static const marketPool = 'market_pool';
   static const status = 'status';
   static const tripState = 'trip_state';
+  static const paymentMethod = 'payment_method';
+  static const paymentStatus = 'payment_status';
+  static const settlementStatus = 'settlement_status';
+  static const supportStatus = 'support_status';
+  static const pickup = 'pickup';
+  static const dropoff = 'dropoff';
+  static const fare = 'fare';
+  static const distanceKm = 'distance_km';
+  static const etaMin = 'eta_min';
+  static const createdAt = 'created_at';
+  static const updatedAt = 'updated_at';
+  static const acceptedAt = 'accepted_at';
+  static const cancelledAt = 'cancelled_at';
+  static const completedAt = 'completed_at';
+  static const cancelReason = 'cancel_reason';
+  static const expiresAt = 'expires_at';
 }
