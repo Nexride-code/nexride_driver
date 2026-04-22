@@ -8,6 +8,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart' as rtdb;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
@@ -347,6 +348,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   int _driverUnreadChatCount = 0;
   /// Missed incoming voice call (this driver was receiver) — cleared when chat/call is opened.
   bool _driverMissedCallNotice = false;
+  DateTime? _lastDriverChatNoticeAt;
   int _routeDeviationStrikeCount = 0;
   int _riderRatingCount = 0;
   int _riderOutstandingCancellationFeesNgn = 0;
@@ -2094,6 +2096,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     _startDriverChatListener(rideId);
+    _scheduleActiveRouteRefresh(
+      force: true,
+      reason: 'resume_rehydrate_route',
+      debounce: Duration.zero,
+    );
     if (_activeRideListenerRideId != rideId ||
         _activeRideSubscription == null) {
       unawaited(_listenToActiveRide(rideId));
@@ -7864,9 +7871,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       if (_hasHydratedDriverChatMessages &&
           receivedNewRiderMessage &&
           mounted) {
-        _showSnackBarSafely(
-          const SnackBar(content: Text('New message from rider')),
-        );
+        _showDriverIncomingChatNotice();
       }
     }
 
@@ -12754,9 +12759,31 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   Future<void> _playChatNotificationSound() async {
     try {
       await _alertSoundService.playChatAlert();
+      await HapticFeedback.lightImpact();
     } catch (error) {
       _log('chat sound error=$error');
     }
+  }
+
+  void _showDriverIncomingChatNotice() {
+    final now = DateTime.now();
+    if (_lastDriverChatNoticeAt != null &&
+        now.difference(_lastDriverChatNoticeAt!) < const Duration(seconds: 2)) {
+      return;
+    }
+    _lastDriverChatNoticeAt = now;
+    if (!mounted) {
+      return;
+    }
+    _showSnackBarSafely(
+      SnackBar(
+        content: const Text('New message from rider'),
+        action: SnackBarAction(
+          label: 'Open',
+          onPressed: _openDriverChat,
+        ),
+      ),
+    );
   }
 
   void _updateDriverMarker() {
