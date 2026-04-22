@@ -9401,6 +9401,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _logRideReq(
           'request listener snapshot source=$source rawChildCount=${rideMap.length} activeOpenCount=${activeOpenRideMap.length} market=$driverCity',
         );
+        _logRideReq(
+          '[DRIVER_DISCOVERY_SNAPSHOT] source=$source rawChildCount=${rideMap.length} '
+          'activeOpenCount=${activeOpenRideMap.length} market=$driverCity',
+        );
         _logPopup('snapshot received raw=${rideMap.length} activeOpen=${activeOpenRideMap.length}');
         _logDiscoveryChain(
           'snapshot received raw=${rideMap.length} activeOpen=${activeOpenRideMap.length}',
@@ -10352,6 +10356,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _presentedRideIds.add(activePopupRide.rideId.trim());
       _logRideReq(
         'popup UI showDialog rideId=${activePopupRide.rideId} countdown=$_kRidePopupCountdownSeconds',
+      );
+      _logRideReq(
+        '[DRIVER_POPUP_SHOW] rideId=${activePopupRide.rideId} '
+        'market=${_rideMarketFromData(activePopupRide.rideData) ?? 'missing'} '
+        'status=${_valueAsText(activePopupRide.rideData['status'])} '
+        'trip_state=${_valueAsText(activePopupRide.rideData['trip_state'])}',
       );
       _logDiscoveryChain(
         'popup UI showDialog rideId=${activePopupRide.rideId} countdown=$_kRidePopupCountdownSeconds',
