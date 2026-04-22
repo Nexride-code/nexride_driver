@@ -5853,8 +5853,14 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     String reason,
   ) {
     final st = rideData == null ? '?' : _valueAsText(rideData['status']);
+    final tripState = rideData == null ? '?' : _valueAsText(rideData['trip_state']);
     final did = rideData == null ? '?' : _valueAsText(rideData['driver_id']);
-    _logRideReq('popup skip rideId=$rideId reason=$reason status=$st driver_id=$did');
+    final market = rideData == null ? '?' : (_rideMarketFromData(rideData) ?? '?');
+    final expectedMarket = _effectiveDriverMarket ?? '?';
+    _logRideReq(
+      'popup skip rideId=$rideId reason=$reason status=$st trip_state=$tripState '
+      'driver_id=$did market=$market expected_market=$expectedMarket',
+    );
   }
 
   /// Final RTDB read before [showDialog]: cancelled / terminal / expired / market / other driver.
@@ -9358,9 +9364,24 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               ) &&
               skipReason.isEmpty;
           if (!qualifies) {
+            final expectedMarket = driverCity;
+            final actualMarket = rideData == null
+                ? ''
+                : (_rideMarketFromData(rideData) ?? '');
+            final rawStatus = rideData == null
+                ? ''
+                : _valueAsText(rideData[RtdbRideRequestFields.status]);
+            final rawTripState = rideData == null
+                ? ''
+                : _valueAsText(rideData[RtdbRideRequestFields.tripState]);
+            final rawDriverId = rideData == null
+                ? ''
+                : _valueAsText(rideData[RtdbRideRequestFields.driverId]);
             _logRideReq(
               '[DRIVER_DISCOVERY_REJECT] rideId=$rideId reason='
-              '${skipReason.isEmpty ? 'service_type_not_active' : skipReason}',
+              '${skipReason.isEmpty ? 'service_type_not_active' : skipReason} '
+              'market_expected=$expectedMarket market_actual=$actualMarket '
+              'status=$rawStatus trip_state=$rawTripState driver_id=$rawDriverId',
             );
           } else {
             _logRideReq('[DRIVER_DISCOVERY_ACCEPT] rideId=$rideId');
