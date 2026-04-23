@@ -2099,11 +2099,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     final rideId = _currentRideId;
     if (rideId == null || rideId.isEmpty) {
-      if (_isOnline &&
-          _rideRequestSubscription == null &&
-          _driverActiveRideId == null) {
-        unawaited(_listenForRideRequests(reason: 'resume'));
-      }
+      _ensureRideDiscoverySubscriptionIfOnline(reason: 'lifecycle_resume_no_local_ride');
       return;
     }
 
@@ -2114,10 +2110,30 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
     if (_callListenerRideId != rideId || _callSubscription == null) {
       _startCallListener(rideId);
+      _ensureRideDiscoverySubscriptionIfOnline(
+        reason: 'lifecycle_resume_call_listener_started',
+      );
       return;
     }
 
     unawaited(_resyncCallState(rideId));
+    _ensureRideDiscoverySubscriptionIfOnline(
+      reason: 'lifecycle_resume_active_ride',
+    );
+  }
+
+  /// While online, discovery must stay attached (including during an active trip).
+  void _ensureRideDiscoverySubscriptionIfOnline({required String reason}) {
+    if (!_isOnline || _isDisposing) {
+      return;
+    }
+    if (_rideRequestSubscription != null) {
+      return;
+    }
+    _logRideReq(
+      '[DISCOVERY_REBIND] reason=$reason subscription=null -> _listenForRideRequests',
+    );
+    unawaited(_listenForRideRequests(reason: reason));
   }
 
   Future<void> _loadCarIcon() async {}
@@ -7841,15 +7857,18 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (_driverChatListenerRideId != r) {
       return;
     }
+    final existing = _driverChatMessagesById[id];
+    final type = existing?.type ?? 'text';
+    final imageUrl = existing?.imageUrl ?? '';
     _driverChatMessagesById[id] = RideChatMessage(
       id: id,
       rideId: r,
       messageId: id,
       senderId: senderId,
       senderRole: 'driver',
-      type: 'text',
+      type: type,
       text: text,
-      imageUrl: '',
+      imageUrl: imageUrl,
       createdAt: clientCreatedAt,
       status: 'sent',
       isRead: false,
@@ -7879,7 +7898,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       messageId: id,
       senderId: senderId,
       senderRole: 'driver',
-      type: 'text',
+      type: existing.type,
       text: text.isNotEmpty ? text : existing.text,
       imageUrl: existing.imageUrl,
       createdAt: existing.createdAt,
@@ -8093,6 +8112,49 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _log(
       '[CHAT_UNREAD_CLEAR] role=driver rideId=$rideId uid=$_effectiveDriverId unreadCount=0',
     );
+  }
+
+  Future<void> _clearOwnRideChatUnreadRtdb(String rideId, String uid) async {
+    final u = uid.trim();
+    if (u.isEmpty) {
+      return;
+    }
+    try {
+      await _rideRequestsRef.root.update(<String, dynamic>{
+        canonicalRideChatUnreadCountPath(rideId, u): 0,
+        canonicalRideChatUnreadUpdatedAtPath(rideId, u):
+            rtdb.ServerValue.timestamp,
+      });
+    } catch (error) {
+      _log('ride chat unread clear failed rideId=$rideId error=$error');
+    }
+  }
+
+  Future<void> _bumpRideChatUnreadForRecipient({
+    required String rideId,
+    required String recipientUid,
+  }) async {
+    final rid = recipientUid.trim();
+    if (rid.isEmpty) {
+      return;
+    }
+    final ref =
+        _rideRequestsRef.root.child(canonicalRideChatUnreadCountPath(rideId, rid));
+    try {
+      await ref.runTransaction((Object? current) {
+        final n =
+            current is int ? current : (current is num ? current.toInt() : 0);
+        return rtdb.Transaction.success(n + 1);
+      });
+      await _rideRequestsRef.root.update(<String, dynamic>{
+        canonicalRideChatUnreadUpdatedAtPath(rideId, rid):
+            rtdb.ServerValue.timestamp,
+      });
+    } catch (error) {
+      _log(
+        'ride chat unread bump failed rideId=$rideId recipient=$rid error=$error',
+      );
+    }
   }
 
   void _resetDriverChatState({bool stopListener = true}) {
@@ -10037,15 +10099,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           _scheduleRideDiscoveryReattach(
             reason: 'stream_error_auto_retry_$code',
           );
-          if (_currentRideId == null && _driverActiveRideId == null) {
-            unawaited(
-              _rollbackFailedGoOnline(
-                driverId: _effectiveDriverId,
-                reason: 'discovery_stream_error_$code',
-                publishedPresence: true,
-              ),
-            );
-          }
         },
       );
       _logRideReq(
@@ -13250,9 +13303,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'created_at': rtdb.ServerValue.timestamp,
         'created_at_client': clientCreatedAt,
         'client_status': 'sent',
+        'local_status': 'sent',
         'server_ack': true,
         'status': 'sent',
         'read': false,
+        'updated_at': rtdb.ServerValue.timestamp,
       };
       final lastMessageMeta = <String, dynamic>{
         'id': messageId,
@@ -13271,6 +13326,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         await rootRef.update(<String, dynamic>{
           '${canonicalRideChatMessagesPath(normalizedRideId)}/$messageId':
               payload,
+          '${canonicalRideChatParticipantPath(normalizedRideId, senderId)}/uid':
+              senderId,
+          '${canonicalRideChatParticipantPath(normalizedRideId, senderId)}/sender_role':
+              'driver',
+          '${canonicalRideChatParticipantPath(normalizedRideId, senderId)}/updated_at':
+              rtdb.ServerValue.timestamp,
           'ride_requests/$normalizedRideId/chat_last_message': lastMessageMeta,
           'ride_requests/$normalizedRideId/chat_last_message_text':
               lastMessageMeta['text'],
@@ -13308,6 +13369,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           text: trimmed,
           clientCreatedAt: clientCreatedAt,
         );
+
+        final riderRecipient = _currentRiderIdForRide.trim();
+        if (riderRecipient.isNotEmpty) {
+          unawaited(
+            _bumpRideChatUnreadForRecipient(
+              rideId: normalizedRideId,
+              recipientUid: riderRecipient,
+            ),
+          );
+        }
 
         unawaited(_mirrorDriverChatToTripRouteLog(
           rideId: normalizedRideId,
@@ -13382,11 +13453,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       '[CHAT_IMAGE_UPLOAD_START] role=driver rideId=$normalizedRideId uid=$senderId',
     );
     try {
-      final participantKey = _chatParticipantKey(senderId, _currentRiderIdForRide);
       final uploaded = await _dispatchPhotoUploadService.uploadRideChatPhoto(
         rideId: normalizedRideId,
         actorId: senderId,
-        participantKey: participantKey,
         asset: DispatchPhotoSelectedAsset(
           localPath: picked.path,
           fileName: picked.name.isNotEmpty
@@ -13423,11 +13492,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
   }
 
-  String _chatParticipantKey(String first, String second) {
-    final ids = <String>[first.trim(), second.trim()]..sort();
-    return ids.join('_');
-  }
-
   void _openDriverChat() {
     final rideId = _activeDriverRideContextId;
     if (rideId == null || !_canOpenChat) {
@@ -13437,6 +13501,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _startDriverChatListener(rideId);
     _log('[CHAT_OPEN] role=driver rideId=$rideId');
     _resetDriverUnreadCount(rideId);
+    unawaited(_clearOwnRideChatUnreadRtdb(rideId, _effectiveDriverId));
     unawaited(
       _markDriverMessagesRead(
         rideId,
