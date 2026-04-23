@@ -8206,39 +8206,27 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       'path=${canonicalRideChatMessagesPath(rideId)}',
     );
 
-    final ref = _rideChatMessagesRef(rideId);
-    unawaited(_loadDriverChatSnapshot(rideId, ref));
+    final ref = _rideChatMessagesRef(rideId).orderByChild('timestamp');
     _driverChatSubscriptions.add(
-      ref.onChildAdded.listen(
-        (event) => _onDriverChatChildEvent(rideId, event),
-        onError: (Object error) {
-          _reportDriverChatIssue(
-            rideId,
-            'listener_child_added_failed',
-            error: error,
+      ref.onValue.listen(
+        (event) {
+          final parsed = parseRideChatSnapshot(
+            rideId: rideId,
+            raw: event.snapshot.value,
           );
+          _driverChatMessagesById
+            ..clear()
+            ..addEntries(
+              parsed.messages.map(
+                (m) => MapEntry<String, RideChatMessage>(m.id, m),
+              ),
+            );
+          _flushDriverChatMessageTable(rideId);
         },
-      ),
-    );
-    _driverChatSubscriptions.add(
-      ref.onChildChanged.listen(
-        (event) => _onDriverChatChildEvent(rideId, event),
         onError: (Object error) {
           _reportDriverChatIssue(
             rideId,
-            'listener_child_changed_failed',
-            error: error,
-          );
-        },
-      ),
-    );
-    _driverChatSubscriptions.add(
-      ref.onChildRemoved.listen(
-        (event) => _onDriverChatChildRemoved(rideId, event),
-        onError: (Object error) {
-          _reportDriverChatIssue(
-            rideId,
-            'listener_child_removed_stream_failed',
+            'listener_onvalue_failed',
             error: error,
           );
         },
@@ -13258,9 +13246,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     final normalizedRideId = rideId.trim();
     final rootRef = _rideRequestsRef.root;
-    final messageId = retryMessageId?.trim().isNotEmpty == true
-        ? retryMessageId!.trim()
-        : (_rideChatMessagesRef(normalizedRideId).push().key?.trim() ?? '');
+    final messagesRef = _rideChatMessagesRef(normalizedRideId);
+    final messageNode = retryMessageId?.trim().isNotEmpty == true
+        ? messagesRef.child(retryMessageId!.trim())
+        : messagesRef.push();
+    final messageId = messageNode.key?.trim() ?? '';
     if (messageId.isEmpty) {
       return 'Unable to start this chat message right now.';
     }
@@ -13294,23 +13284,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
 
       final payload = <String, dynamic>{
-        'id': messageId,
-        'message_id': messageId,
-        'ride_id': normalizedRideId,
-        'sender_id': senderId,
-        'sender_role': 'driver',
+        'senderId': senderId,
+        'senderRole': 'driver',
         'type': messageType,
         'text': trimmed,
-        'image_url': normalizedImageUrl,
-        'local_temp_id': messageId,
-        'created_at': rtdb.ServerValue.timestamp,
-        'created_at_client': clientCreatedAt,
-        'client_status': 'sent',
-        'local_status': 'sent',
-        'server_ack': true,
-        'status': 'sent',
-        'read': false,
-        'updated_at': rtdb.ServerValue.timestamp,
+        'imageUrl': normalizedImageUrl.isEmpty ? null : normalizedImageUrl,
+        'timestamp': rtdb.ServerValue.timestamp,
       };
       final lastMessageMeta = <String, dynamic>{
         'id': messageId,
@@ -13326,9 +13305,15 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'messageId=$messageId path=${canonicalRideChatMessagesPath(normalizedRideId)}/$messageId',
       );
       try {
+        Future<void> writeAttempt() async {
+          await messageNode.set(payload).timeout(_kRideChatSendTimeout);
+        }
+        try {
+          await writeAttempt();
+        } catch (_) {
+          await writeAttempt();
+        }
         await rootRef.update(<String, dynamic>{
-          '${canonicalRideChatMessagesPath(normalizedRideId)}/$messageId':
-              payload,
           '${canonicalRideChatParticipantPath(normalizedRideId, senderId)}/uid':
               senderId,
           '${canonicalRideChatParticipantPath(normalizedRideId, senderId)}/sender_role':
