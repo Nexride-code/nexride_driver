@@ -86,6 +86,11 @@ const double _kSafetyStopMovementThresholdMeters = 18;
 const double _kSafetyExpectedStopRadiusMeters = 90;
 const Duration _kSafetyLongStopDuration = Duration(minutes: 2);
 const Duration _kSafetyPromptCooldown = Duration(minutes: 3);
+const double _kSuddenStopMinPriorKmh = 32;
+const double _kSuddenStopMaxAfterKmh = 14;
+const double _kSuddenStopDropKmh = 22;
+const double _kSuddenStopMinDtSec = 0.35;
+const double _kSuddenStopMaxDtSec = 8;
 const Duration _kDriverMapInitializationTimeout = Duration(seconds: 12);
 const Duration _kRideChatSendTimeout = Duration(seconds: 8);
 const Set<String> _kRenderableRideStatuses = <String>{
@@ -364,6 +369,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   bool _hasActivePopup = false;
   bool _tripStarted = false;
   bool _popupOpen = false;
+
+  /// FIFO of incoming open-pool offers when a popup is already visible (Grab-style backlog).
+  final List<_MatchedRideRequest> _rideRequestPopupQueue = <_MatchedRideRequest>[];
+  static const int _kMaxRideRequestPopupQueue = 8;
   bool _routeBuildInFlight = false;
   bool _arrivedEnabled = false;
   bool _hasLoggedArrivedEnabled = false;
@@ -404,6 +413,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   DateTime? _lastTelemetryCheckpointAt;
   LatLng? _lastRouteOrigin;
   LatLng? _lastSafetyCheckLocation;
+  DateTime? _lastDriverSpeedSampleAt;
+  double? _lastDriverImpliedSpeedKmh;
   LatLng? _lastTelemetryCheckpointPosition;
   String? _activeSafetyPromptMessage;
   String _debugStartupStep = 'starting driver map';
@@ -2584,6 +2595,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _handledRideIds.clear();
     _suppressedRidePopupIds.clear();
     _terminalSelfAcceptedRideIds.clear();
+    _rideRequestPopupQueue.clear();
     _onlineSessionStartedAt = 0;
     _lastAvailabilityIntentOnline = false;
     _sessionTrackedRideId = null;
@@ -5928,25 +5940,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     return n.isNotEmpty && _terminalSelfAcceptedRideIds.contains(n);
   }
 
-  /// Active-trip context wins over market discovery (handles brief post-accept races).
-  String? _dominantActiveRideIdForDiscovery() {
-    final c = _currentRideId?.trim();
-    if (c != null && c.isNotEmpty) {
-      return c;
-    }
-    final d = _driverActiveRideId?.trim();
-    if (d != null && d.isNotEmpty) {
-      return d;
-    }
-    final listener = _activeRideListenerRideId?.trim();
-    if (listener != null &&
-        listener.isNotEmpty &&
-        _terminalSelfAcceptedRideIds.contains(listener)) {
-      return listener;
-    }
-    return null;
-  }
-
   String? _popupLocalSkipReason(String rideId) {
     final normalizedId = rideId.trim();
     if (_handledRideIds.contains(normalizedId)) {
@@ -5987,6 +5980,61 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     return null;
+  }
+
+  void _enqueueRideRequestPopupIfIdleSlot(_MatchedRideRequest ride) {
+    final id = ride.rideId.trim();
+    if (id.isEmpty) {
+      return;
+    }
+    if (_isTerminalSelfAcceptedRide(id) ||
+        _foreverSuppressedRidePopupIds.contains(id)) {
+      return;
+    }
+    if (_isDriverSameRideContextBlockingPopup(id)) {
+      return;
+    }
+    final local = _popupLocalSkipReason(id);
+    if (local != null) {
+      return;
+    }
+    if (_activePopupRideId?.trim() == id) {
+      return;
+    }
+    for (final existing in _rideRequestPopupQueue) {
+      if (existing.rideId.trim() == id) {
+        return;
+      }
+    }
+    while (_rideRequestPopupQueue.length >= _kMaxRideRequestPopupQueue) {
+      final dropped = _rideRequestPopupQueue.removeAt(0);
+      _logRideReq(
+        '[DISCOVERY_QUEUE] dropped_oldest rideId=${dropped.rideId} '
+        'cap=$_kMaxRideRequestPopupQueue',
+      );
+    }
+    _rideRequestPopupQueue.add(ride);
+    _logRideReq(
+      '[DISCOVERY_QUEUE] enqueued rideId=$id depth=${_rideRequestPopupQueue.length}',
+    );
+  }
+
+  Future<void> _flushRideRequestPopupQueueAfterClose() async {
+    if (!mounted || !_isOnline) {
+      return;
+    }
+    if (_popupOpen || _hasActivePopup || _ridePopupOpenPipelineLocked) {
+      return;
+    }
+    if (_rideRequestPopupQueue.isEmpty) {
+      return;
+    }
+    final next = _rideRequestPopupQueue.removeAt(0);
+    _logRideReq(
+      '[DISCOVERY_QUEUE] flushing next rideId=${next.rideId} '
+      'remaining=${_rideRequestPopupQueue.length}',
+    );
+    await showRideRequestPopup(next);
   }
 
   bool _isCanonicalOpenForClaim(String canonicalState) {
@@ -6703,6 +6751,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _lastMoveTime = null;
       _lastSafetyPromptAt = null;
       _lastSafetyCheckLocation = null;
+      _lastDriverSpeedSampleAt = null;
+      _lastDriverImpliedSpeedKmh = null;
       _lastTelemetryCheckpointPosition = null;
       _lastTelemetryCheckpointAt = null;
       _safetyMonitoringActive = false;
@@ -7378,6 +7428,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _declinedRideIds.clear();
     _handledRideIds.clear();
     _suppressedRidePopupIds.clear();
+    _rideRequestPopupQueue.clear();
     _onlineSessionStartedAt = 0;
 
     _logRtdb('hard reset before listener attach');
@@ -7516,6 +7567,25 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           );
           if (invalidReason != null) {
             _logInvalidRideBlocked(rideId: rideId, reason: invalidReason);
+            if (invalidReason == 'status_cancelled' && mounted) {
+              final by = _valueAsText(rideData['cancelled_by']).toLowerCase();
+              final actor = _valueAsText(rideData['cancel_actor']).toLowerCase();
+              final riderCancelled = by == 'rider' ||
+                  by == 'rider_user' ||
+                  by == 'user' ||
+                  actor == 'rider' ||
+                  actor == 'rider_user' ||
+                  actor == 'user';
+              _showSnackBarSafely(
+                SnackBar(
+                  content: Text(
+                    riderCancelled
+                        ? 'The rider cancelled this trip.'
+                        : 'This trip was cancelled.',
+                  ),
+                ),
+              );
+            }
             await _clearDriverActiveRideNode(
               rideId: rideId,
               reason: invalidReason,
@@ -8741,6 +8811,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _suppressedRidePopupIds.clear();
     _foreverSuppressedRidePopupIds.clear();
     _terminalSelfAcceptedRideIds.clear();
+    _rideRequestPopupQueue.clear();
     _cancelPendingRouteRequests(reason: 'go_offline');
     _onlineSessionStartedAt = 0;
     _lastAvailabilityIntentOnline = false;
@@ -9522,32 +9593,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           return;
         }
 
-        // Active trip (or terminal accept + active listener) blocks market discovery.
-        final dominantRideId = _dominantActiveRideIdForDiscovery();
-        if (dominantRideId != null && dominantRideId.isNotEmpty) {
-          _logDriverReq(
-            'skippedReason=active_trip_guard dominant=$dominantRideId '
-            'driverActive=$_driverActiveRideId current=$_currentRideId '
-            'listenerRide=$_activeRideListenerRideId source=$source',
-          );
-          _logRideReq(
-            '[MATCH_DEBUG][ACTIVE_TRIP_WON_OVER_DISCOVERY] rideId=$dominantRideId '
-            'driverActive=$_driverActiveRideId current=$_currentRideId '
-            'listenerRide=$_activeRideListenerRideId '
-            'terminalLocked=${_terminalSelfAcceptedRideIds.contains(dominantRideId)} '
-            'source=$source',
-          );
-          _logRideReq(
-            'snapshot skipped active-trip guard dominant=$dominantRideId '
-            'driverActive=$_driverActiveRideId current=$_currentRideId source=$source',
-          );
-          _logDiscoveryChain(
-            'snapshot_blocked active_ride_guard dominant=$dominantRideId '
-            'current=$_currentRideId driverActive=$_driverActiveRideId source=$source',
-          );
-          return;
-        }
-
         final activePopupRideId = _activePopupRideId;
         if ((_popupOpen || _hasActivePopup) &&
             activePopupRideId != null &&
@@ -9617,23 +9662,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           }
         }
 
-        // Do not gate on [_rideStatus] here: active trips are already excluded via
-        // [_driverActiveRideId]/[_currentRideId] above. A stale non-idle status
-        // would otherwise block all incoming request popups forever.
-
-        if (_popupOpen || _hasActivePopup) {
-          _logDriverReq(
-            'skippedReason=popup_already_open open=$_popupOpen '
-            'hasActive=$_hasActivePopup activePopup=$_activePopupRideId source=$source',
-          );
-          _logRideReq(
-            'snapshot skipped popup already open open=$_popupOpen hasActive=$_hasActivePopup '
-            'activePopup=$_activePopupRideId source=$source',
-          );
-          _logPopup('skipped reason=popup_already_open');
-          _logDiscoveryChain('skipped reason=popup_already_open source=$source');
-          return;
-        }
+        // Do not gate on [_rideStatus] here: stale non-idle status must not block
+        // incoming offers. Active-trip blocking was removed so drivers still receive
+        // the open-pool stream while assigned (queue handles concurrent popups).
 
         final candidates = <_MatchedRideRequest>[];
         var skipLogBudget = 6;
@@ -9767,6 +9798,32 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           return;
         }
 
+        for (var i = 1; i < candidates.length; i++) {
+          _enqueueRideRequestPopupIfIdleSlot(candidates[i]);
+        }
+        if (_popupOpen || _hasActivePopup) {
+          _enqueueRideRequestPopupIfIdleSlot(recheckedRide);
+          _logDriverReq(
+            'skippedReason=popup_busy_queued rideId=${recheckedRide.rideId} '
+            'open=$_popupOpen hasActive=$_hasActivePopup '
+            'queue_depth=${_rideRequestPopupQueue.length} source=$source',
+          );
+          _logRideReq(
+            '[DISCOVERY_QUEUE] deferred primary rideId=${recheckedRide.rideId} '
+            'queue_depth=${_rideRequestPopupQueue.length} source=$source',
+          );
+          _logPopup(
+            'queued reason=popup_busy rideId=${recheckedRide.rideId} '
+            'depth=${_rideRequestPopupQueue.length}',
+          );
+          _logDiscoveryChain(
+            'snapshot_queued popup_busy rideId=${recheckedRide.rideId} '
+            'depth=${_rideRequestPopupQueue.length} source=$source',
+          );
+          _logListenerStillActiveWaitingForFreshRides();
+          return;
+        }
+
         _currentCandidateRideId = recheckedRide.rideId;
         _logRideReq(
           'popup opening rideId=${recheckedRide.rideId} source=$source (calling showRideRequestPopup)',
@@ -9781,8 +9838,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _logPopup('opening rideId=${recheckedRide.rideId}');
         _logDiscoveryChain('popup opening rideId=${recheckedRide.rideId}');
         if (_ridePopupOpenPipelineLocked) {
+          _enqueueRideRequestPopupIfIdleSlot(recheckedRide);
           _logRidePopup(
-            'skip rideId=${recheckedRide.rideId} reason=pipeline_locked',
+            'queued rideId=${recheckedRide.rideId} reason=pipeline_locked',
           );
           if (_currentCandidateRideId == recheckedRide.rideId) {
             _currentCandidateRideId = null;
@@ -10196,13 +10254,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     if (_popupOpen || _hasActivePopup) {
+      _enqueueRideRequestPopupIfIdleSlot(ride);
       _logRidePopup(
-        'skip rideId=${ride.rideId} reason=popup_already_active '
-        'open=$_popupOpen hasActive=$_hasActivePopup activePopup=$_activePopupRideId',
+        'queued rideId=${ride.rideId} reason=popup_already_active '
+        'open=$_popupOpen hasActive=$_hasActivePopup activePopup=$_activePopupRideId '
+        'depth=${_rideRequestPopupQueue.length}',
       );
       _logRideReq(
-        'popup blocked reason=popup_already_active rideId=${ride.rideId} '
-        'open=$_popupOpen hasActive=$_hasActivePopup activePopup=$_activePopupRideId',
+        'popup deferred to queue reason=popup_already_active rideId=${ride.rideId} '
+        'open=$_popupOpen hasActive=$_hasActivePopup activePopup=$_activePopupRideId '
+        'queue_depth=${_rideRequestPopupQueue.length}',
       );
       return;
     }
@@ -11003,6 +11064,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _popupDismissedRideId = null;
         _popupDismissedReason = null;
       }
+      scheduleMicrotask(() {
+        unawaited(_flushRideRequestPopupQueueAfterClose());
+      });
     }
   }
 
@@ -12587,6 +12651,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _safetyMonitoringActive = true;
     _lastMoveTime = DateTime.now();
     _lastSafetyCheckLocation = _driverLocation;
+    _lastDriverSpeedSampleAt = null;
+    _lastDriverImpliedSpeedKmh = null;
     _routeDeviationStrikeCount = 0;
     _logSafety('monitoring started rideId=$rideId');
   }
@@ -12595,6 +12661,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _safetyMonitoringActive = false;
     _lastMoveTime = null;
     _lastSafetyCheckLocation = null;
+    _lastDriverSpeedSampleAt = null;
+    _lastDriverImpliedSpeedKmh = null;
     _routeDeviationStrikeCount = 0;
     _clearSafetyPrompt();
   }
@@ -12643,6 +12711,20 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     return minimumDistance.isFinite ? minimumDistance : null;
   }
 
+  Future<void> _publishRiderSuddenStopSafetyAlert(String rideId) async {
+    try {
+      await _rideRequestsRef.child(rideId).update(<String, dynamic>{
+        'rider_safety_alert': <String, dynamic>{
+          'type': 'sudden_stop',
+          'issued_at': DateTime.now().millisecondsSinceEpoch,
+          'source': 'driver_device',
+        },
+      });
+    } catch (error) {
+      _logSafety('rider_safety_alert publish failed rideId=$rideId error=$error');
+    }
+  }
+
   void _checkDriverSafety() {
     final rideId = _currentRideId;
     if (!_safetyMonitoringActive ||
@@ -12660,6 +12742,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (previousPosition == null) {
       _lastMoveTime = now;
       _lastSafetyCheckLocation = currentPosition;
+      _lastDriverSpeedSampleAt = null;
+      _lastDriverImpliedSpeedKmh = null;
       return;
     }
 
@@ -12673,7 +12757,50 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (nearExpectedStop) {
       _routeDeviationStrikeCount = 0;
       _lastMoveTime = now;
+      _lastDriverImpliedSpeedKmh = null;
+      _lastDriverSpeedSampleAt = now;
     } else {
+      if (_lastDriverSpeedSampleAt != null) {
+        final dtSec =
+            now.difference(_lastDriverSpeedSampleAt!).inMilliseconds / 1000.0;
+        if (dtSec >= _kSuddenStopMinDtSec && dtSec <= _kSuddenStopMaxDtSec) {
+          final impliedKmh = (movement / dtSec) * 3.6;
+          final prev = _lastDriverImpliedSpeedKmh;
+          if (prev != null &&
+              prev >= _kSuddenStopMinPriorKmh &&
+              impliedKmh <= _kSuddenStopMaxAfterKmh &&
+              (prev - impliedKmh) >= _kSuddenStopDropKmh) {
+            _logSafety(
+              'sudden deceleration detected rideId=$rideId '
+              'prevKmh=${prev.toStringAsFixed(1)} nextKmh=${impliedKmh.toStringAsFixed(1)}',
+            );
+            unawaited(
+              _driverTripSafetyService.createSafetyFlag(
+                rideId: rideId,
+                riderId: _currentRiderIdForRide,
+                driverId: _effectiveDriverId,
+                serviceType: _serviceTypeKey(_currentRideData?['service_type']),
+                flagType: 'sudden_stop',
+                source: 'driver_map_monitor',
+                message:
+                    'Driver device inferred a sharp slowdown during an active trip.',
+                status: 'manual_review',
+                severity: 'high',
+              ),
+            );
+            _showDriverSafetyPrompt(
+              rideId: rideId,
+              reason: 'sudden_stop',
+              message:
+                  'Sharp braking detected. If you are in danger, pull over safely and use SOS.',
+            );
+            unawaited(_publishRiderSuddenStopSafetyAlert(rideId));
+          }
+          _lastDriverImpliedSpeedKmh = impliedKmh;
+        } else if (dtSec > _kSuddenStopMaxDtSec || dtSec <= 0) {
+          _lastDriverImpliedSpeedKmh = null;
+        }
+      }
       if (movement >= _kSafetyStopMovementThresholdMeters) {
         _lastMoveTime = now;
       } else if (_lastMoveTime != null &&
@@ -12733,6 +12860,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       } else {
         _routeDeviationStrikeCount = 0;
       }
+      _lastDriverSpeedSampleAt = now;
     }
 
     _lastSafetyCheckLocation = currentPosition;
