@@ -6028,6 +6028,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   /// aligned with `database.rules.json` discovery branch for open-pool reads.
   static const Set<String> _kOpenDiscoveryRawLifecycle = <String>{
     'requested',
+    'requesting',
     'searching_driver',
     'pending_driver_acceptance',
     'pending_driver_action',
@@ -9389,12 +9390,17 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             final rawExpires = rideData == null
                 ? ''
                 : _valueAsText(rideData['expires_at']);
+            final nowMs = DateTime.now().millisecondsSinceEpoch;
+            final expiresEval = rideData == null
+                ? 0
+                : _rideExpiryTimestamp(rideData);
             _logRideReq(
               '[DRIVER_DISCOVERY_REJECT] rideId=$rideId reason='
               '${skipReason.isEmpty ? 'service_type_not_active' : skipReason} '
               'market_expected=$expectedMarket market_actual=$actualMarket '
               'status=$rawStatus trip_state=$rawTripState driver_id=$rawDriverId '
-              'search_timeout_at=$rawSearchTimeout request_expires_at=$rawRequestExpires expires_at=$rawExpires',
+              'search_timeout_at=$rawSearchTimeout request_expires_at=$rawRequestExpires '
+              'expires_at=$rawExpires expires_eval_ms=$expiresEval now_ms=$nowMs',
             );
           } else {
             _logRideReq('[DRIVER_DISCOVERY_ACCEPT] rideId=$rideId');

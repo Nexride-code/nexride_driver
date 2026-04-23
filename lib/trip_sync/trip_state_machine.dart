@@ -118,7 +118,7 @@ class TripStateMachine {
   static String _canonicalFromLegacyNormalizedStatus(String normalizedStatus) {
     return switch (normalizedStatus) {
       '' || 'idle' => TripLifecycleState.requested,
-      'requested' => TripLifecycleState.requested,
+      'requested' || 'requesting' => TripLifecycleState.requested,
       'searching' ||
       'searching_driver' ||
       // Rider “matching” UI and newer lifecycle labels map to open search pool.
@@ -174,6 +174,9 @@ class TripStateMachine {
         assignedNorm != 'waiting';
 
     String? canonicalFromTripStateField() {
+      if (normalizedTripState == 'requesting') {
+        return TripLifecycleState.requested;
+      }
       if (normalizedTripState == 'pending_driver_acceptance' ||
           normalizedTripState == 'driver_reviewing_request') {
         return TripLifecycleState.pendingDriverAction;
