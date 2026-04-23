@@ -107,10 +107,22 @@ class TripStateMachine {
   };
 
   static String canonicalStateFromSnapshot(Map<String, dynamic>? rideData) {
+    if (rideData == null) {
+      return canonicalStateFromValues(
+        tripState: null,
+        status: null,
+        assignedDriverId: null,
+      );
+    }
+    final d = _normalizeText(rideData['driver_id']);
+    dynamic assignedDriverId = rideData['driver_id'];
+    if (d.isEmpty || d == 'waiting') {
+      assignedDriverId = rideData['matched_driver_id'];
+    }
     return canonicalStateFromValues(
-      tripState: rideData?['trip_state'],
-      status: rideData?['status'],
-      assignedDriverId: rideData?['driver_id'],
+      tripState: rideData['trip_state'],
+      status: rideData['status'],
+      assignedDriverId: assignedDriverId,
     );
   }
 
