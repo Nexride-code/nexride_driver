@@ -5918,7 +5918,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final rideMarket = rideMarketRaw != null
         ? (_normalizeCity(rideMarketRaw) ?? rideMarketRaw)
         : null;
-    final driverMarket = _effectiveDriverMarket;
+    // Use the currently bound discovery query market when available so
+    // popup filtering stays aligned with the live listener contract.
+    final driverMarket = _rideRequestsListenerBoundCity ?? _effectiveDriverMarket;
     if (rideMarket == null ||
         rideMarket.isEmpty ||
         driverMarket == null ||
@@ -6246,7 +6248,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final rideMarketRaw = _rideMarketFromData(rideData);
     final rideMarket =
         rideMarketRaw != null ? (_normalizeCity(rideMarketRaw) ?? rideMarketRaw) : null;
-    final driverMarket = _effectiveDriverMarket;
+    // Keep post-discovery popup checks aligned with the active discovery market.
+    final driverMarket = _rideRequestsListenerBoundCity ?? _effectiveDriverMarket;
     if (rideMarket == null || rideMarket.isEmpty) {
       _logPopupFix('skip reason=missing_market rideId=$rideId');
       _logPopupServerSkip(rideId, rideData, 'missing_market');
