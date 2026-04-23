@@ -272,6 +272,26 @@ class TripStateMachine {
     return legacyStatusForCanonical(canonicalStateFromSnapshot(rideData));
   }
 
+  static bool isChatEligibleUiStatus(String status) {
+    final normalized = _normalizeText(status);
+    return normalized == 'pending_driver_action' ||
+        normalized == 'assigned' ||
+        normalized == 'accepted' ||
+        normalized == 'driver_accepted' ||
+        normalized == 'arriving' ||
+        normalized == 'arrived' ||
+        normalized == 'on_trip' ||
+        normalized == 'in_progress';
+  }
+
+  static bool isChatEligibleRideSnapshot(Map<String, dynamic>? rideData) {
+    if (rideData == null || rideData.isEmpty) {
+      return false;
+    }
+    final uiStatus = uiStatusFromSnapshot(rideData);
+    return isChatEligibleUiStatus(uiStatus);
+  }
+
   static bool isTerminal(String canonicalState) {
     return terminalStates.contains(canonicalState);
   }
