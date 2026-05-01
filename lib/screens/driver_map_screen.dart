@@ -6,6 +6,7 @@ import 'dart:ui' show ImageFilter;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart' as rtdb;
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -22,6 +23,7 @@ import '../services/call_permissions.dart';
 import '../services/call_service.dart';
 import '../services/dispatch_photo_upload_service.dart';
 import '../services/driver_alert_sound_service.dart';
+import '../services/local_backend_simulation_service.dart';
 import '../services/road_route_service.dart';
 import '../services/driver_trip_safety_service.dart';
 import '../services/rider_accountability_service.dart';
@@ -31,6 +33,7 @@ import '../support/driver_location_access_support.dart';
 import '../support/driver_dispatch_support.dart';
 import '../support/driver_profile_bootstrap_support.dart';
 import '../support/driver_profile_support.dart';
+import '../support/dispatch_payment_support.dart';
 import '../support/realtime_database_error_support.dart';
 import '../support/rtdb_flow_debug_log.dart';
 import '../support/ride_chat_support.dart';
@@ -262,18 +265,24 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       const UserSupportTicketService();
   final DriverTripSafetyService _driverTripSafetyService =
       DriverTripSafetyService();
+  final FirebaseFunctions _functions =
+      FirebaseFunctions.instanceFor(region: 'us-central1');
   final RoadRouteService _roadRouteService = RoadRouteService();
   final Set<String> _presentedRideIds = <String>{};
   final Set<String> _timedOutRideIds = <String>{};
   final Set<String> _declinedRideIds = <String>{};
   final Set<String> _handledRideIds = <String>{};
+
   /// Ride IDs that must never re-open the market discovery popup (accept/decline).
   final Set<String> _suppressedRidePopupIds = <String>{};
+
   /// Accepted (or otherwise completed-on-this-device) ride IDs — never unsuppress, never popup again this session.
   final Set<String> _foreverSuppressedRidePopupIds = <String>{};
+
   /// Terminal self-accept lock: after a successful accept transaction, discovery and
   /// unavailable UI must not fight the active-trip flow for this [rideId] until trip end.
   final Set<String> _terminalSelfAcceptedRideIds = <String>{};
+
   /// Prevents concurrent [showRideRequestPopup] opens from parallel RTDB snapshots.
   bool _ridePopupOpenPipelineLocked = false;
   int _lastActiveHeartbeatLogCount = 0;
@@ -290,9 +299,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   GoogleMapController? _mapController;
   StreamSubscription<Position>? _positionStream;
   StreamSubscription<rtdb.DatabaseEvent>? _rideRequestSubscription;
+
   /// City key for the active [ride_requests] market query (null if no listener).
   String? _rideRequestsListenerBoundCity;
   int _rideRequestListenerToken = 0;
+
   /// Serializes discovery attach/cancel so two callers cannot overlap native query setup.
   Future<void> _rideDiscoveryAttachChain = Future<void>.value();
   StreamSubscription<rtdb.DatabaseEvent>? _driverActiveRideSubscription;
@@ -353,6 +364,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   String _riderCashAccessStatus = 'enabled';
   int _onlineSessionStartedAt = 0;
   int _driverUnreadChatCount = 0;
+
   /// Missed incoming voice call (this driver was receiver) — cleared when chat/call is opened.
   bool _driverMissedCallNotice = false;
   DateTime? _lastDriverChatNoticeAt;
@@ -363,6 +375,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   bool _isOnline = false;
   bool _lastAvailabilityIntentOnline = false;
   bool _availabilityActionInProgress = false;
+
   /// Last successfully loaded driver profile from RTDB (used for fast GO ONLINE).
   Map<String, dynamic>? _lastDriverProfileSnapshot;
   bool _isDriverChatOpen = false;
@@ -372,7 +385,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   bool _popupOpen = false;
 
   /// FIFO of incoming open-pool offers when a popup is already visible (Grab-style backlog).
-  final List<_MatchedRideRequest> _rideRequestPopupQueue = <_MatchedRideRequest>[];
+  final List<_MatchedRideRequest> _rideRequestPopupQueue =
+      <_MatchedRideRequest>[];
   static const int _kMaxRideRequestPopupQueue = 8;
   bool _routeBuildInFlight = false;
   bool _arrivedEnabled = false;
@@ -392,6 +406,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   bool _routeRequestInFlight = false;
   bool _isDisposing = false;
   bool _rideDiscoveryListenerHealthy = false;
+  bool _showDriverDebugOverlay = true;
   bool _discoveryPermissionDeniedNoticeVisible = false;
   String? _activePopupRideId;
   String? _acceptingPopupRideId;
@@ -400,6 +415,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   String? _mapInitializationError;
   String? _routeOverlayError;
   String _rideStatus = 'offline';
+  String _socketStatus = 'disconnected';
+  String _lastApiCallStatus = 'idle';
+  String _lastActionError = '';
   String _lastRouteBuildKey = '';
   String _lastRouteConsistencyCheckKey = '';
   bool _startupPermissionNoticeShown = false;
@@ -424,6 +442,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   int _routeRequestGeneration = 0;
   _PendingRouteRequest? _pendingRouteRequest;
   Timer? _rideDiscoveryReattachTimer;
+  Timer? _rideDiscoveryPollingTimer;
+  DateTime? _lastRideStreamEventAt;
+  final Set<String> _localWalletCreditedRideIds = <String>{};
+  final LocalBackendSimulationService _backendSimulation =
+      LocalBackendSimulationService();
 
   Color get _gold => const Color(0xFFD4AF37);
   LatLng get _nigeriaMarketCenter => const LatLng(
@@ -570,6 +593,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _driverLocation = _selectedLaunchCityCenter;
+    _startRideDiscoveryFallbackPolling();
     print('DRIVER_MAP_INIT');
     _log(
       'screen init auth=${FirebaseAuth.instance.currentUser?.uid ?? 'none'} widgetDriverId=${widget.driverId} platform=${defaultTargetPlatform.name}',
@@ -1215,7 +1239,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     );
     _setDebugStartupStep('map ready');
     _moveCameraToIdleState();
-    _log('camera initialized attempt=$attempt target=${_driverLocation.latitude},${_driverLocation.longitude}');
+    _log(
+        'camera initialized attempt=$attempt target=${_driverLocation.latitude},${_driverLocation.longitude}');
   }
 
   void _retryMapInitialization() {
@@ -1401,8 +1426,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
       _notifyMapLayerChanged();
       _refreshDriverMapPresentation(reason: 'tile_recovery_$phaseLabel');
-      await _nudgeDriverMapTiles(controller, reason: 'tile_recovery_$phaseLabel');
-      _log('map tile recovery applied recovery=$_mapTileRecoveryCount phase=$phaseLabel');
+      await _nudgeDriverMapTiles(controller,
+          reason: 'tile_recovery_$phaseLabel');
+      _log(
+          'map tile recovery applied recovery=$_mapTileRecoveryCount phase=$phaseLabel');
       _log(
         'map tiles visible or render retry count=$_mapTileRecoveryCount',
       );
@@ -1608,6 +1635,91 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _log('[RIDE_REQ] $message');
   }
 
+  void _setApiStatus(
+    String status, {
+    String? errorMessage,
+  }) {
+    _lastApiCallStatus = status;
+    if (errorMessage != null) {
+      _lastActionError = errorMessage;
+    } else if (status == 'success') {
+      _lastActionError = '';
+    }
+    if (mounted) {
+      _setStateSafely(() {});
+    }
+  }
+
+  String _debugTripStateLabel() {
+    final canonical =
+        TripStateMachine.canonicalStateFromSnapshot(_currentRideData);
+    return switch (canonical) {
+      TripLifecycleState.searchingDriver => 'searching',
+      TripLifecycleState.pendingDriverAction => 'assigned',
+      TripLifecycleState.driverAccepted => 'accepted',
+      TripLifecycleState.driverArrived => 'arrived',
+      TripLifecycleState.tripStarted => 'in_progress',
+      TripLifecycleState.tripCompleted => 'completed',
+      TripLifecycleState.tripCancelled => 'cancelled',
+      _ => _rideStatus,
+    };
+  }
+
+  void _ensureActiveTripNavigation({
+    required String rideId,
+    required Map<String, dynamic> rideData,
+  }) {
+    _logRideReq(
+        '[NAVIGATION_TRIGGERED] rideId=$rideId target=active_trip_forced');
+    if (mounted) {
+      _setStateSafely(() {
+        _popupOpen = false;
+        _hasActivePopup = false;
+        _activePopupRideId = null;
+        _driverActiveRideId = rideId;
+        _currentRideId = rideId;
+        _currentRideData = Map<String, dynamic>.from(rideData);
+        _rideStatus = TripStateMachine.uiStatusFromSnapshot(rideData);
+      });
+    } else {
+      _popupOpen = false;
+      _hasActivePopup = false;
+      _activePopupRideId = null;
+      _driverActiveRideId = rideId;
+      _currentRideId = rideId;
+      _currentRideData = Map<String, dynamic>.from(rideData);
+      _rideStatus = TripStateMachine.uiStatusFromSnapshot(rideData);
+    }
+    Future<void>.delayed(const Duration(seconds: 2), () {
+      if (_currentRideId == rideId && _driverActiveRideId != rideId) {
+        _driverActiveRideId = rideId;
+        if (mounted) {
+          _setStateSafely(() {});
+        }
+      }
+    });
+  }
+
+  void _startRideDiscoveryFallbackPolling() {
+    _rideDiscoveryPollingTimer?.cancel();
+    _rideDiscoveryPollingTimer =
+        Timer.periodic(const Duration(seconds: 8), (_) {
+      if (!_isOnline || _isDisposing) {
+        return;
+      }
+      final stale = _lastRideStreamEventAt == null ||
+          DateTime.now().difference(_lastRideStreamEventAt!) >
+              const Duration(seconds: 16);
+      if (!_rideDiscoveryListenerHealthy || stale) {
+        _socketStatus = 'polling_fallback';
+        _logRideReq(
+          '[SOCKET_FALLBACK] trigger stale=$stale healthy=$_rideDiscoveryListenerHealthy',
+        );
+        unawaited(_listenForRideRequests(reason: 'fallback_polling_recover'));
+      }
+    });
+  }
+
   String _firebaseErrorCode(Object error) {
     if (error is FirebaseException) {
       return error.code.trim().isEmpty ? 'unknown' : error.code;
@@ -1624,7 +1736,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
   String _discoveryListenerFailureMessage(Object error) {
     final code = _firebaseErrorCode(error).toLowerCase();
-    if (isRealtimeDatabasePermissionDenied(error) || code == 'permission-denied') {
+    if (isRealtimeDatabasePermissionDenied(error) ||
+        code == 'permission-denied') {
       return 'We could not load nearby ride requests (access denied). '
           'Confirm you are signed in, then try again. If it keeps happening, '
           'support may need to adjust ride discovery access in the backend.';
@@ -1659,7 +1772,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final status = rideData == null ? '' : _valueAsText(rideData['status']);
     final tripState =
         rideData == null ? '' : _valueAsText(rideData['trip_state']);
-    final driverId = rideData == null ? '' : _valueAsText(rideData['driver_id']);
+    final driverId =
+        rideData == null ? '' : _valueAsText(rideData['driver_id']);
     _logRideReq(
       '[MATCH_EVENT] event=$eventName rideId=$rideId status=$status '
       'trip_state=$tripState driver_id=$driverId',
@@ -2057,6 +2171,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _rideRequestListenerToken += 1;
     _rideRequestSubscription?.cancel();
     _rideDiscoveryReattachTimer?.cancel();
+    _rideDiscoveryPollingTimer?.cancel();
     _rideRequestsListenerBoundCity = null;
     _driverActiveRideSubscription?.cancel();
     _activeRideSubscription?.cancel();
@@ -2107,7 +2222,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     final rideId = _currentRideId;
     if (rideId == null || rideId.isEmpty) {
-      _ensureRideDiscoverySubscriptionIfOnline(reason: 'lifecycle_resume_no_local_ride');
+      _ensureRideDiscoverySubscriptionIfOnline(
+          reason: 'lifecycle_resume_no_local_ride');
       return;
     }
 
@@ -2303,8 +2419,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
     final businessModel =
         normalizedDriverBusinessModel(profile['businessModel']);
-    final verification =
-        normalizedDriverVerification(profile['verification']);
+    final verification = normalizedDriverVerification(profile['verification']);
     return businessModel['canGoOnline'] == true &&
         driverVerificationCanGoOnline(verification);
   }
@@ -2491,7 +2606,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
   void _markDiscoveryPermissionDeniedNoticeVisible({required String source}) {
     _discoveryPermissionDeniedNoticeVisible = true;
-    _logRideReq('[DRIVER_DISCOVERY_TRACE] snackbar_state=set_access_denied source=$source');
+    _logRideReq(
+        '[DRIVER_DISCOVERY_TRACE] snackbar_state=set_access_denied source=$source');
   }
 
   void _clearDiscoveryPermissionDeniedNotice({required String source}) {
@@ -2501,7 +2617,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final messenger = ScaffoldMessenger.maybeOf(context);
     messenger?.hideCurrentSnackBar();
     _discoveryPermissionDeniedNoticeVisible = false;
-    _logRideReq('[DRIVER_DISCOVERY_TRACE] snackbar_state=cleared_access_denied source=$source');
+    _logRideReq(
+        '[DRIVER_DISCOVERY_TRACE] snackbar_state=cleared_access_denied source=$source');
   }
 
   Future<Position?> _requestReadyPosition({
@@ -3354,15 +3471,18 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     return switch (reason) {
       'driver_session_lost' =>
         'Your online session timestamp is missing. Go OFFLINE, then GO ONLINE again, and try accepting.',
-      'driver_offline' || 'driver_offline_local' =>
+      'driver_offline' ||
+      'driver_offline_local' =>
         'You look offline to the server. Check your connection, go online again, then try accepting.',
       'driver_unavailable' =>
         'The server still shows you as busy. Wait a few seconds and tap Accept again.',
       'driver_request_listener_missing' =>
         'Ride alerts are not connected. Go OFFLINE, then GO ONLINE again, then try accepting.',
-      'driver_trip_in_progress' || 'driver_trip_in_progress_local' =>
+      'driver_trip_in_progress' ||
+      'driver_trip_in_progress_local' =>
         'Finish or leave your other active trip before accepting this one.',
-      'driver_auth_mismatch' || 'missing_driver_id' =>
+      'driver_auth_mismatch' ||
+      'missing_driver_id' =>
         'Sign in again as this driver account, then try accepting.',
       'driver_record_missing' =>
         'Your driver profile could not be loaded. Check your connection and try again.',
@@ -3404,9 +3524,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       final area = _valueAsText(driverRecord['area']);
       final lastActive = _parseCreatedAt(driverRecord['last_active_at']);
       final nowMs = DateTime.now().millisecondsSinceEpoch;
-      final locAgeSec = lastActive > 0
-          ? ((nowMs - lastActive) / 1000).round()
-          : -1;
+      final locAgeSec =
+          lastActive > 0 ? ((nowMs - lastActive) / 1000).round() : -1;
       final failed = <String>[];
       if (!isOnline && !isOnlineSnake) {
         failed.add('is_online');
@@ -3567,6 +3686,46 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'restaurants_food',
       _ => 'ride',
     };
+  }
+
+  Set<String> _effectiveDriverServiceTypes() {
+    final profile = _lastDriverProfileSnapshot;
+    if (profile == null || profile.isEmpty) {
+      return const <String>{'ride'};
+    }
+    final rawServiceTypes = profile['serviceTypes'] ?? profile['service_types'];
+    final normalizedRequestTypes = <String>{};
+    if (rawServiceTypes is List) {
+      for (final rawType in rawServiceTypes) {
+        final key = _serviceTypeKey(rawType);
+        if (key.isNotEmpty) {
+          normalizedRequestTypes.add(key);
+        }
+      }
+    }
+
+    final rawDriverServiceTypes =
+        profile['driver_service_types'] ?? profile['driverServiceTypes'];
+    if (rawDriverServiceTypes is List) {
+      for (final rawType in rawDriverServiceTypes) {
+        final normalized = _valueAsText(rawType).toLowerCase();
+        if (normalized == 'car_driver') {
+          normalizedRequestTypes.add('ride');
+        } else if (normalized == 'dispatch_driver') {
+          normalizedRequestTypes.add('dispatch_delivery');
+        }
+      }
+    }
+
+    if (normalizedRequestTypes.isEmpty) {
+      normalizedRequestTypes.add('ride');
+    }
+    return normalizedRequestTypes;
+  }
+
+  bool _driverCanAcceptServiceType(String serviceType) {
+    final normalized = _serviceTypeKey(serviceType);
+    return _effectiveDriverServiceTypes().contains(normalized);
   }
 
   bool _isSupportedDriverServiceType(String serviceType) {
@@ -4482,7 +4641,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     try {
       sessions = await _callService.fetchCallsForReceiver(driverId);
     } catch (error) {
-      _logRideCall('incoming resync fetch failed driverId=$driverId error=$error');
+      _logRideCall(
+          'incoming resync fetch failed driverId=$driverId error=$error');
       sessions = const <RideCallSession>[];
     }
 
@@ -4571,8 +4731,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return;
     }
 
-    final resumePerRideListener = _callSubscription != null &&
-        _callListenerRideId == normalizedRideId;
+    final resumePerRideListener =
+        _callSubscription != null && _callListenerRideId == normalizedRideId;
     if (resumePerRideListener) {
       _logRideReq(
         '[MATCH_DEBUG][QUERY_DETACH:calls/$normalizedRideId] resync_prefetch',
@@ -5018,7 +5178,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
       _logRideCall('[CALL_TOKEN_FETCH_OK] rideId=${session.rideId}');
     } on RideCallException catch (error) {
-      _logRideCall('[CALL_TOKEN_FETCH_FAIL] rideId=${session.rideId} error=$error');
+      _logRideCall(
+          '[CALL_TOKEN_FETCH_FAIL] rideId=${session.rideId} error=$error');
       _showSnackBarSafely(
         SnackBar(
           content: Text(error.message),
@@ -5523,22 +5684,23 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     return trimmed == _effectiveDriverId;
   }
 
-  int _rideExpiryTimestamp(Map<String, dynamic> rideData) {
+  ({int value, String field}) _rideExpiryInfo(Map<String, dynamic> rideData) {
+    // Single expiry source: request_expires_at, fallback expires_at.
     for (final key in <String>[
-      'expires_at',
-      'expiresAt',
-      'timeout_at',
-      'search_timeout_at',
       'request_expires_at',
+      'expires_at',
+      'expiresAt'
     ]) {
       final timestamp = _parseCreatedAt(rideData[key]);
       if (timestamp > 0) {
-        return timestamp;
+        return (value: timestamp, field: key);
       }
     }
-
-    return 0;
+    return (value: 0, field: 'none');
   }
+
+  int _rideExpiryTimestamp(Map<String, dynamic> rideData) =>
+      _rideExpiryInfo(rideData).value;
 
   int _assignmentExpiryTimestamp(Map<String, dynamic>? rideData) {
     if (rideData == null) {
@@ -5839,8 +6001,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     required String rideId,
     required Map<String, dynamic> incoming,
   }) {
-    final baseline =
-        _currentRideId == rideId ? _currentRideData : null;
+    final baseline = _currentRideId == rideId ? _currentRideData : null;
     if (baseline == null || baseline.isEmpty) {
       return Map<String, dynamic>.from(incoming);
     }
@@ -5889,7 +6050,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
   /// Open-pool rides back in [searching]/[requested] with a public driver slot
   /// should not stay locally suppressed from an older accept cycle.
-  void _maybeUnsuppressOpenPoolRide(String rideId, Map<String, dynamic> rideData) {
+  void _maybeUnsuppressOpenPoolRide(
+      String rideId, Map<String, dynamic> rideData) {
     final n = rideId.trim();
     if (n.isEmpty) {
       return;
@@ -5904,9 +6066,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
     final did = _valueAsText(rideData['driver_id']);
     final dLower = did.toLowerCase();
-    final openSlot = did.isEmpty ||
-        dLower == 'waiting' ||
-        did == _effectiveDriverId;
+    final openSlot =
+        did.isEmpty || dLower == 'waiting' || did == _effectiveDriverId;
     if (!openSlot) {
       return;
     }
@@ -5925,9 +6086,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     String reason,
   ) {
     final st = rideData == null ? '?' : _valueAsText(rideData['status']);
-    final tripState = rideData == null ? '?' : _valueAsText(rideData['trip_state']);
+    final tripState =
+        rideData == null ? '?' : _valueAsText(rideData['trip_state']);
     final did = rideData == null ? '?' : _valueAsText(rideData['driver_id']);
-    final market = rideData == null ? '?' : (_rideMarketFromData(rideData) ?? '?');
+    final market =
+        rideData == null ? '?' : (_rideMarketFromData(rideData) ?? '?');
     final expectedMarket = _effectiveDriverMarket ?? '?';
     _logRideReq(
       'popup skip rideId=$rideId reason=$reason status=$st trip_state=$tripState '
@@ -5963,7 +6126,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         : null;
     // Use the currently bound discovery query market when available so
     // popup filtering stays aligned with the live listener contract.
-    final driverMarket = _rideRequestsListenerBoundCity ?? _effectiveDriverMarket;
+    final driverMarket =
+        _rideRequestsListenerBoundCity ?? _effectiveDriverMarket;
     if (rideMarket == null ||
         rideMarket.isEmpty ||
         driverMarket == null ||
@@ -5974,9 +6138,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     final did = _valueAsText(rideData['driver_id']);
     final dLower = did.toLowerCase();
-    if (did.isNotEmpty &&
-        dLower != 'waiting' &&
-        did != _effectiveDriverId) {
+    if (did.isNotEmpty && dLower != 'waiting' && did != _effectiveDriverId) {
       return 'driver_already_assigned';
     }
 
@@ -6104,7 +6266,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   }
 
   bool _isRideClaimableForDriverAccept(Map<String, dynamic> rideData) {
-    final canonicalState = TripStateMachine.canonicalStateFromSnapshot(rideData);
+    print('DRIVER_ACCEPT_ATTEMPT');
+    final acceptMode =
+        isDevRelaxedRideAcceptanceEnabled ? 'dev_relaxed' : 'production_strict';
+    _logRideReq('DRIVER_ACCEPT_MODE=$acceptMode');
+    final canonicalState =
+        TripStateMachine.canonicalStateFromSnapshot(rideData);
     if (TripStateMachine.isPendingDriverAssignmentState(canonicalState)) {
       final assignedDriver = _valueAsText(rideData['driver_id']);
       return assignedDriver == _effectiveDriverId &&
@@ -6115,23 +6282,83 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return false;
     }
 
-    final status = _normalizedRideStatus(_valueAsText(rideData['status']));
+    final statusRaw = _valueAsText(rideData['status']).trim().toLowerCase();
+    final tripStateRaw =
+        _valueAsText(rideData['trip_state']).trim().toLowerCase();
+    final status = _normalizedRideStatus(statusRaw);
     if (status == 'accepted' ||
         status == 'cancelled' ||
         status == 'expired' ||
         status == 'completed') {
       return false;
     }
+    final isRequestOpen =
+        statusRaw == 'requesting' && tripStateRaw == 'requesting';
+    if (!isRequestOpen) {
+      print('DRIVER_ACCEPT_BLOCKED: NOT_REQUESTING');
+      return false;
+    }
 
-    final expiresAt = _rideExpiryTimestamp(rideData);
-    if (expiresAt > 0 &&
-        DateTime.now().millisecondsSinceEpoch >= expiresAt) {
+    final expiresAt = _rideExpiryInfo(rideData).value;
+    if (expiresAt > 0 && DateTime.now().millisecondsSinceEpoch >= expiresAt) {
       return false;
     }
 
     final assignedDriver = _valueAsText(rideData['driver_id']);
-    return assignedDriver.isEmpty || assignedDriver.toLowerCase() == 'waiting';
+    if (!(assignedDriver.isEmpty ||
+        assignedDriver.toLowerCase() == 'waiting')) {
+      print('DRIVER_ACCEPT_BLOCKED: DRIVER_ALREADY_ASSIGNED');
+      return false;
+    }
+
+    if (isDevRelaxedRideAcceptanceEnabled) {
+      return true;
+    }
+
+    final rideMarketRaw = _rideMarketFromData(rideData) ?? '';
+    final rideMarket =
+        (_normalizeCity(rideMarketRaw) ?? rideMarketRaw).trim().toLowerCase();
+    final driverMarketRaw =
+        _rideRequestsListenerBoundCity ?? _effectiveDriverMarket ?? '';
+    final driverMarket = (_normalizeCity(driverMarketRaw) ?? driverMarketRaw)
+        .trim()
+        .toLowerCase();
+    if (rideMarket.isEmpty ||
+        driverMarket.isEmpty ||
+        rideMarket != driverMarket) {
+      return false;
+    }
+
+    final riderTrustSnapshot =
+        _asStringDynamicMap(rideData['rider_trust_snapshot']);
+    final verificationStatus = _valueAsText(
+      riderTrustSnapshot?['verificationStatus'],
+    ).toLowerCase();
+    final riskStatus =
+        _valueAsText(riderTrustSnapshot?['riskStatus']).toLowerCase();
+    final paymentStatus = _valueAsText(
+      riderTrustSnapshot?['paymentStatus'],
+    ).toLowerCase();
+
+    final verificationPassed =
+        verificationStatus == 'verified' || verificationStatus == 'approved';
+    final paymentReviewValid = paymentStatus.isEmpty ||
+        paymentStatus == 'clear' ||
+        paymentStatus == 'ok' ||
+        paymentStatus == 'valid';
+    final notRestricted = riskStatus != 'restricted' &&
+        riskStatus != 'suspended' &&
+        riskStatus != 'blacklisted';
+
+    return verificationPassed && paymentReviewValid && notRestricted;
   }
+
+  bool get isDevRelaxedRideAcceptanceEnabled =>
+      !kReleaseMode &&
+      const bool.fromEnvironment(
+        'DEV_RELAXED_RIDE_ACCEPTANCE',
+        defaultValue: false,
+      );
 
   String _rawTripLifecycleToken(dynamic value) =>
       _valueAsText(value).trim().toLowerCase();
@@ -6184,9 +6411,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logRtdb('popup skipped reason=already_active_same_ride rideId=$n');
       return;
     }
-    final ui = rideData == null
-        ? ''
-        : TripStateMachine.uiStatusFromSnapshot(rideData);
+    final ui =
+        rideData == null ? '' : TripStateMachine.uiStatusFromSnapshot(rideData);
     final canonical = rideData == null
         ? TripLifecycleState.requested
         : TripStateMachine.canonicalStateFromSnapshot(rideData);
@@ -6203,9 +6429,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
     final did = rideData == null ? '' : _valueAsText(rideData['driver_id']);
     final dLower = did.toLowerCase();
-    if (did.isNotEmpty &&
-        dLower != 'waiting' &&
-        did != _effectiveDriverId) {
+    if (did.isNotEmpty && dLower != 'waiting' && did != _effectiveDriverId) {
       _logRtdb('popup skipped reason=driver_already_assigned rideId=$n');
       return;
     }
@@ -6271,10 +6495,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     final rideMarketRaw = _rideMarketFromData(rideData);
-    final rideMarket =
-        rideMarketRaw != null ? (_normalizeCity(rideMarketRaw) ?? rideMarketRaw) : null;
+    final rideMarket = rideMarketRaw != null
+        ? (_normalizeCity(rideMarketRaw) ?? rideMarketRaw)
+        : null;
     // Keep post-discovery popup checks aligned with the active discovery market.
-    final driverMarket = _rideRequestsListenerBoundCity ?? _effectiveDriverMarket;
+    final driverMarket =
+        _rideRequestsListenerBoundCity ?? _effectiveDriverMarket;
     if (rideMarket == null || rideMarket.isEmpty) {
       _logPopupFix('skip reason=missing_market rideId=$rideId');
       _logPopupServerSkip(rideId, rideData, 'missing_market');
@@ -6288,13 +6514,19 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return 'market_mismatch';
     }
 
-    final expiresAt = _rideExpiryTimestamp(rideData);
+    final expiry = _rideExpiryInfo(rideData);
+    final expiresAt = expiry.value;
     final nowTimestamp = DateTime.now().millisecondsSinceEpoch;
     if (expiresAt > 0 && nowTimestamp >= expiresAt) {
-      _logPopupFix('skip reason=expired rideId=$rideId');
+      _logPopupFix(
+        'skip reason=expired rideId=$rideId now_ms=$nowTimestamp expires_at=$expiresAt '
+        'delta_ms=${nowTimestamp - expiresAt} expiry_field=${expiry.field}',
+      );
       _logPopupServerSkip(rideId, rideData, 'expired');
       _logRideReq(
-        '[MATCH_DEBUG][DRIVER_FILTER] rideId=$rideId status=$uiStatus qualifies=false reason=expired',
+        '[MATCH_DEBUG][DRIVER_FILTER] rideId=$rideId status=$uiStatus '
+        'qualifies=false reason=expired now_ms=$nowTimestamp expires_at=$expiresAt '
+        'delta_ms=${nowTimestamp - expiresAt} expiry_field=${expiry.field}',
       );
       return 'expired';
     }
@@ -6342,7 +6574,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     if (_destinationLatLngFromRideData(rideData) == null) {
-      _logPopupFix('skip reason=missing_destination_coordinates rideId=$rideId');
+      _logPopupFix(
+          'skip reason=missing_destination_coordinates rideId=$rideId');
       _logPopupServerSkip(rideId, rideData, 'missing_destination_coordinates');
       return 'missing_destination_coordinates';
     }
@@ -6381,8 +6614,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final countryValue = _valueAsText(rideData['country']);
     final countryCodeValue = _valueAsText(rideData['country_code']);
     final rideMarketRaw = _rideMarketFromData(rideData);
-    final rideMarket =
-        rideMarketRaw != null ? (_normalizeCity(rideMarketRaw) ?? rideMarketRaw) : null;
+    final rideMarket = rideMarketRaw != null
+        ? (_normalizeCity(rideMarketRaw) ?? rideMarketRaw)
+        : null;
     final driverMarket = _effectiveDriverMarket;
 
     if (statusValue.isEmpty) {
@@ -6557,15 +6791,42 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     return switch (blockedReason) {
+      'driver_already_set' => 'Ride already taken',
       'assignment_expired' ||
       'expired' ||
       'driver_response_timeout' =>
-        'This request timed out before it could be confirmed.',
+        'Ride expired',
+      'status_not_requesting' || 'transaction_not_committed' => 'Invalid state',
+      'service_not_allowed' || 'service_type_not_enabled_for_driver' =>
+        'Driver not eligible',
       'driver_session_lost' ||
       'driver_not_ready' =>
         'Your driver session needs to reconnect before you can accept rides.',
+      'ride_missing' => 'Ride already taken',
+      'unauthorized' => 'Driver not eligible',
+      'invalid_input' => 'Invalid state',
       _ => 'This request is no longer available.',
     };
+  }
+
+  String _acceptFailureMessageFromException(Object error) {
+    if (error is FirebaseFunctionsException) {
+      final details = error.details;
+      if (details is Map) {
+        final reason = _valueAsText(details['reason']);
+        if (reason.isNotEmpty) {
+          return _acceptBlockedMessage(
+            blockedReason: reason,
+            rideData: _currentRideData,
+            rideId: _currentRideId,
+          );
+        }
+      }
+      if (error.message != null && error.message!.trim().isNotEmpty) {
+        return error.message!.trim();
+      }
+    }
+    return 'Unable to accept this ride right now.';
   }
 
   bool _rideBelongsToAnotherDriver(Map<String, dynamic>? rideData) {
@@ -6935,7 +7196,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         '[RTDB_WRITE] phase=error operation=critical_post_accept_update '
         'rideId=$rideId uid=$driverId paths=ride_requests+drivers code=$code error=$error',
       );
-      _logRtdb('critical post-accept update failure rideId=$rideId error=$error');
+      _logRtdb(
+          'critical post-accept update failure rideId=$rideId error=$error');
       rethrow;
     }
   }
@@ -6977,37 +7239,47 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       'admin_rides/$rideId/summary/market': _rideMarketFromData(rideData),
       'admin_rides/$rideId/summary/status': committedStatus,
       'admin_rides/$rideId/summary/trip_state': committedCanonicalForCommit,
-      'admin_rides/$rideId/summary/payment_method': _valueAsText(rideData['payment_method']),
-      'admin_rides/$rideId/summary/payment_status': _valueAsText(rideData['payment_status']),
-      'admin_rides/$rideId/summary/settlement_status': _valueAsText(rideData['settlement_status']).isEmpty
-          ? 'pending'
-          : _valueAsText(rideData['settlement_status']),
-      'admin_rides/$rideId/summary/support_status': _valueAsText(rideData['support_status']).isEmpty
-          ? 'normal'
-          : _valueAsText(rideData['support_status']),
+      'admin_rides/$rideId/summary/payment_method':
+          _valueAsText(rideData['payment_method']),
+      'admin_rides/$rideId/summary/payment_status':
+          _valueAsText(rideData['payment_status']),
+      'admin_rides/$rideId/summary/settlement_status':
+          _valueAsText(rideData['settlement_status']).isEmpty
+              ? 'pending'
+              : _valueAsText(rideData['settlement_status']),
+      'admin_rides/$rideId/summary/support_status':
+          _valueAsText(rideData['support_status']).isEmpty
+              ? 'normal'
+              : _valueAsText(rideData['support_status']),
       'admin_rides/$rideId/summary/created_at': rideData['created_at'],
-      'admin_rides/$rideId/summary/accepted_at': rideData['accepted_at'] ?? nowServer,
+      'admin_rides/$rideId/summary/accepted_at':
+          rideData['accepted_at'] ?? nowServer,
       'admin_rides/$rideId/summary/cancelled_at': rideData['cancelled_at'],
       'admin_rides/$rideId/summary/completed_at': rideData['completed_at'],
-      'admin_rides/$rideId/summary/cancel_reason': _valueAsText(rideData['cancel_reason']),
+      'admin_rides/$rideId/summary/cancel_reason':
+          _valueAsText(rideData['cancel_reason']),
       'admin_rides/$rideId/summary/updated_at': nowServer,
       'support_queue/$rideId/ride_id': rideId,
       'support_queue/$rideId/rider_id': riderId,
       'support_queue/$rideId/driver_id': driverId,
       'support_queue/$rideId/status': committedStatus,
       'support_queue/$rideId/trip_state': committedCanonicalForCommit,
-      'support_queue/$rideId/payment_status': _valueAsText(rideData['payment_status']),
-      'support_queue/$rideId/settlement_status': _valueAsText(rideData['settlement_status']).isEmpty
-          ? 'pending'
-          : _valueAsText(rideData['settlement_status']),
-      'support_queue/$rideId/support_status': _valueAsText(rideData['support_status']).isEmpty
-          ? 'normal'
-          : _valueAsText(rideData['support_status']),
+      'support_queue/$rideId/payment_status':
+          _valueAsText(rideData['payment_status']),
+      'support_queue/$rideId/settlement_status':
+          _valueAsText(rideData['settlement_status']).isEmpty
+              ? 'pending'
+              : _valueAsText(rideData['settlement_status']),
+      'support_queue/$rideId/support_status':
+          _valueAsText(rideData['support_status']).isEmpty
+              ? 'normal'
+              : _valueAsText(rideData['support_status']),
       'support_queue/$rideId/created_at': rideData['created_at'],
       'support_queue/$rideId/accepted_at': rideData['accepted_at'] ?? nowServer,
       'support_queue/$rideId/cancelled_at': rideData['cancelled_at'],
       'support_queue/$rideId/completed_at': rideData['completed_at'],
-      'support_queue/$rideId/cancel_reason': _valueAsText(rideData['cancel_reason']),
+      'support_queue/$rideId/cancel_reason':
+          _valueAsText(rideData['cancel_reason']),
       'support_queue/$rideId/last_event': 'driver_accept',
       'support_queue/$rideId/updated_at': nowServer,
     };
@@ -7310,7 +7582,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               'assignment_timeout_ms': null,
               'last_assignment_driver_id': driverId,
               'last_assignment_release_reason': reason,
-              if (reindexMarket != null && reindexMarket.isNotEmpty) ...<String, dynamic>{
+              if (reindexMarket != null &&
+                  reindexMarket.isNotEmpty) ...<String, dynamic>{
                 'market': reindexMarket,
                 'market_pool': reindexMarket,
               },
@@ -7445,6 +7718,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final subscription = _rideRequestSubscription;
     _rideRequestSubscription = null;
     _rideDiscoveryListenerHealthy = false;
+    _socketStatus = 'disconnected';
     _rideRequestsListenerBoundCity = null;
     await subscription?.cancel();
     if (hadListener) {
@@ -7568,6 +7842,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             rideId: rideId,
             incoming: rawRideData,
           );
+          _logRideReq(
+            '[SOCKET_UPDATE_RECEIVED] rideId=$rideId '
+            'status=${TripStateMachine.uiStatusFromSnapshot(rideData)}',
+          );
 
           final assignedDriverId = _valueAsText(rideData['driver_id']);
           if (assignedDriverId != _effectiveDriverId) {
@@ -7630,7 +7908,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             _logInvalidRideBlocked(rideId: rideId, reason: invalidReason);
             if (invalidReason == 'status_cancelled' && mounted) {
               final by = _valueAsText(rideData['cancelled_by']).toLowerCase();
-              final actor = _valueAsText(rideData['cancel_actor']).toLowerCase();
+              final actor =
+                  _valueAsText(rideData['cancel_actor']).toLowerCase();
               final riderCancelled = by == 'rider' ||
                   by == 'rider_user' ||
                   by == 'user' ||
@@ -7978,8 +8257,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     var receivedNewRiderMessage = false;
 
     for (final message in messages) {
-      if (message.senderRole != 'rider' ||
-          message.senderId == driverId) {
+      if (message.senderRole != 'rider' || message.senderId == driverId) {
         continue;
       }
 
@@ -8090,7 +8368,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     _lastDriverChatErrorNoticeKey = issueKey;
     if (error != null && isRealtimeDatabasePermissionDenied(error)) {
-      _log('[CHAT_PERMISSION_DENIED] rideId=$rideId message=$message error=$error');
+      _log(
+          '[CHAT_PERMISSION_DENIED] rideId=$rideId message=$message error=$error');
     }
     if (_isDriverChatSessionActive(rideId)) {
       _showSnackBarSafely(
@@ -8183,8 +8462,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (rid.isEmpty) {
       return;
     }
-    final ref =
-        _rideRequestsRef.root.child(canonicalRideChatUnreadCountPath(rideId, rid));
+    final ref = _rideRequestsRef.root
+        .child(canonicalRideChatUnreadCountPath(rideId, rid));
     try {
       await ref.runTransaction((Object? current) {
         final n =
@@ -8657,7 +8936,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _lastAvailabilityIntentOnline = true;
 
       _log('[ONLINE] start driverId=$driverId city=$cityToSave');
-      if (!_preOnlinePublishGate(cityToSave: cityToSave, driverArea: driverArea)) {
+      if (!_preOnlinePublishGate(
+          cityToSave: cityToSave, driverArea: driverArea)) {
         _log('[ONLINE] fail reason=pre_online_publish_gate');
         _showAvailabilityFailureNotice(
           'Could not go online: city or service area is incomplete. Pick a launch city and try again.',
@@ -9407,7 +9687,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     try {
       var snap = await profileRef.get();
       var map = _asStringDynamicMap(snap.value);
-      _logRideReq('[DRIVER_CHECK] exists=${snap.exists} data=${map ?? {}} source=$source');
+      _logRideReq(
+          '[DRIVER_CHECK] exists=${snap.exists} data=${map ?? {}} source=$source');
       if (!snap.exists) {
         await profileRef.set({
           'id': authUid,
@@ -9428,7 +9709,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       market = DriverServiceAreaConfig.marketForCity(
         market.isEmpty ? targetMarket : market,
       ).city;
-      if (_valueAsText(map?['market']) != market || _valueAsText(map?['city']) != market) {
+      if (_valueAsText(map?['market']) != market ||
+          _valueAsText(map?['city']) != market) {
         await profileRef.update({
           'market': market,
           'market_pool': market,
@@ -9439,7 +9721,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         });
         snap = await profileRef.get();
         map = _asStringDynamicMap(snap.value);
-        _logRideReq('[DRIVER_PROFILE_REPAIR] normalized driver node data=${map ?? {}}');
+        _logRideReq(
+            '[DRIVER_PROFILE_REPAIR] normalized driver node data=${map ?? {}}');
       }
       return market;
     } catch (error) {
@@ -9505,7 +9788,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       '[DRIVER_DISCOVERY_TRACE] driverSnapshot exists=${snap.exists} data=${snapMap ?? {}}',
     );
     String? driverMarket = repairedMarket;
-    if ((driverMarket == null || driverMarket.trim().isEmpty) && snapMap != null) {
+    if ((driverMarket == null || driverMarket.trim().isEmpty) &&
+        snapMap != null) {
       driverMarket = _valueAsText(snapMap['market']);
       if (driverMarket.isEmpty) {
         driverMarket = _valueAsText(snapMap['market_pool']);
@@ -9520,7 +9804,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _logRideReq('[DRIVER_DISCOVERY_TRACE] driverMarket=$driverMarket');
     _logRideReq('[DRIVER_DISCOVERY_TRACE] queryMarket=$queryMarket');
     if (!snap.exists || queryMarket.isEmpty) {
-      _logRideReq('[DRIVER_DISCOVERY_TRACE] BLOCKING DISCOVERY invalid driver profile');
+      _logRideReq(
+          '[DRIVER_DISCOVERY_TRACE] BLOCKING DISCOVERY invalid driver profile');
       _showAvailabilityFailureNotice(
         'Driver profile missing market. Please update your profile and try GO ONLINE again.',
       );
@@ -9563,7 +9848,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     if (_driverCity == null || _driverCity!.trim().isEmpty) {
       _driverCity = driverCity;
-      _logRtdb('ride request listener using launch market=$driverCity (driver city unset)');
+      _logRtdb(
+          'ride request listener using launch market=$driverCity (driver city unset)');
     }
 
     _logRideReq(
@@ -9641,467 +9927,468 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       required String source,
       required int listenerToken,
     }) async {
-        if (listenerToken != _rideRequestListenerToken) {
-          _logRideReq(
-            'snapshot skipped reason=stale_listener source=$source token=$listenerToken activeToken=$_rideRequestListenerToken',
-          );
-          return;
-        }
-        final raw = snapshot.value;
-        final rideMap = <String, dynamic>{};
-
-        if (raw is Map) {
-          raw.forEach((key, value) {
-            if (key != null) {
-              rideMap[key.toString()] = value;
-            }
-          });
-        }
-
-        final activeOpenRideMap = <String, Map<String, dynamic>>{};
-        for (final entry in rideMap.entries) {
-          final rideId = entry.key;
-          final rideData = _asStringDynamicMap(entry.value);
-          final status = rideData == null
-              ? 'payload_not_map'
-              : TripStateMachine.uiStatusFromSnapshot(rideData);
-          if (rideData != null) {
-            _logRideReq(
-              '[RIDER_WRITE] observed rideId=$rideId '
-              'market=${_rideMarketFromData(rideData) ?? 'missing'} '
-              'status=${_valueAsText(rideData[RtdbRideRequestFields.status])} '
-              'trip_state=${_valueAsText(rideData[RtdbRideRequestFields.tripState])} '
-              'driver_id=${_valueAsText(rideData[RtdbRideRequestFields.driverId])} '
-              'created_at=${_parseCreatedAt(rideData[RtdbRideRequestFields.createdAt])} '
-              'expires_at=${_rideExpiryTimestamp(rideData)}',
-            );
-            _logRideReq(
-              '[DRIVER_DISCOVERY_CANDIDATE] rideId=$rideId '
-              'market=${_rideMarketFromData(rideData) ?? 'missing'} '
-              'status=${_valueAsText(rideData[RtdbRideRequestFields.status])} '
-              'trip_state=${_valueAsText(rideData[RtdbRideRequestFields.tripState])} '
-              'driver_id=${_valueAsText(rideData[RtdbRideRequestFields.driverId])} '
-              'created_at=${_parseCreatedAt(rideData[RtdbRideRequestFields.createdAt])} '
-              'expires_at=${_rideExpiryTimestamp(rideData)}',
-            );
-          }
-          final skipReason = rideData == null
-              ? 'payload_not_map'
-              : _popupServerSkipReason(
-                      rideId,
-                      rideData,
-                      marketDiscoveryStage: true,
-                    ) ??
-                  '';
-          final qualifies = rideData != null &&
-              DriverFeatureFlags.activeRequestServiceTypes.contains(
-                _serviceTypeKey(rideData['service_type']),
-              ) &&
-              skipReason.isEmpty;
-          if (!qualifies) {
-            final expectedMarket = driverCity;
-            final actualMarket = rideData == null
-                ? ''
-                : (_rideMarketFromData(rideData) ?? '');
-            final rawStatus = rideData == null
-                ? ''
-                : _valueAsText(rideData[RtdbRideRequestFields.status]);
-            final rawTripState = rideData == null
-                ? ''
-                : _valueAsText(rideData[RtdbRideRequestFields.tripState]);
-            final rawDriverId = rideData == null
-                ? ''
-                : _valueAsText(rideData[RtdbRideRequestFields.driverId]);
-            final rawSearchTimeout = rideData == null
-                ? ''
-                : _valueAsText(rideData['search_timeout_at']);
-            final rawRequestExpires = rideData == null
-                ? ''
-                : _valueAsText(rideData['request_expires_at']);
-            final rawExpires = rideData == null
-                ? ''
-                : _valueAsText(rideData['expires_at']);
-            final nowMs = DateTime.now().millisecondsSinceEpoch;
-            final expiresEval = rideData == null
-                ? 0
-                : _rideExpiryTimestamp(rideData);
-            _logRideReq(
-              '[DRIVER_DISCOVERY_REJECT] rideId=$rideId reason='
-              '${skipReason.isEmpty ? 'service_type_not_active' : skipReason} '
-              'market_expected=$expectedMarket market_actual=$actualMarket '
-              'status=$rawStatus trip_state=$rawTripState driver_id=$rawDriverId '
-              'search_timeout_at=$rawSearchTimeout request_expires_at=$rawRequestExpires '
-              'expires_at=$rawExpires expires_eval_ms=$expiresEval now_ms=$nowMs',
-            );
-          } else {
-            _logRideReq('[DRIVER_DISCOVERY_ACCEPT] rideId=$rideId');
-            debugPrint(
-              '[DRIVER_REQUEST_RECEIVED] rideId=$rideId '
-              'market=${_rideMarketFromData(rideData) ?? ''}',
-            );
-          }
-          _logRideReq(
-            'ride discovery evaluation rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason} source=$source',
-          );
-          _logRideReq(
-            '[MATCH_DEBUG][DRIVER_LISTENER] rideId=$rideId source=$source '
-            'status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason}',
-          );
-          _logReqDebug(
-            'ride eval rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason}',
-          );
-          if (qualifies) {
-            activeOpenRideMap[rideId] = rideData;
-          }
-        }
-
-        _logReqDebug(
-          'snapshot count=${rideMap.length} activeOpen=${activeOpenRideMap.length} market=$driverCity',
+      if (listenerToken != _rideRequestListenerToken) {
+        _logRideReq(
+          'snapshot skipped reason=stale_listener source=$source token=$listenerToken activeToken=$_rideRequestListenerToken',
         );
-        _logDriverReq(
-          'snapshotCount=${rideMap.length} activeOpenSnapshotCount=${activeOpenRideMap.length} source=$source',
-        );
-        if (activeOpenRideMap.isEmpty) {
-          _logDriverReq('candidateRideId=(none)');
+        return;
+      }
+      final raw = snapshot.value;
+      final rideMap = <String, dynamic>{};
+
+      if (raw is Map) {
+        raw.forEach((key, value) {
+          if (key != null) {
+            rideMap[key.toString()] = value;
+          }
+        });
+      }
+
+      final activeOpenRideMap = <String, Map<String, dynamic>>{};
+      for (final entry in rideMap.entries) {
+        final rideId = entry.key;
+        final rideData = _asStringDynamicMap(entry.value);
+        final status = rideData == null
+            ? 'payload_not_map'
+            : TripStateMachine.uiStatusFromSnapshot(rideData);
+        if (rideData != null) {
+          _logRideReq(
+            '[RIDER_WRITE] observed rideId=$rideId '
+            'market=${_rideMarketFromData(rideData) ?? 'missing'} '
+            'status=${_valueAsText(rideData[RtdbRideRequestFields.status])} '
+            'trip_state=${_valueAsText(rideData[RtdbRideRequestFields.tripState])} '
+            'driver_id=${_valueAsText(rideData[RtdbRideRequestFields.driverId])} '
+            'created_at=${_parseCreatedAt(rideData[RtdbRideRequestFields.createdAt])} '
+            'expires_at=${_rideExpiryTimestamp(rideData)}',
+          );
+          _logRideReq(
+            '[DRIVER_DISCOVERY_CANDIDATE] rideId=$rideId '
+            'market=${_rideMarketFromData(rideData) ?? 'missing'} '
+            'status=${_valueAsText(rideData[RtdbRideRequestFields.status])} '
+            'trip_state=${_valueAsText(rideData[RtdbRideRequestFields.tripState])} '
+            'driver_id=${_valueAsText(rideData[RtdbRideRequestFields.driverId])} '
+            'created_at=${_parseCreatedAt(rideData[RtdbRideRequestFields.createdAt])} '
+            'expires_at=${_rideExpiryTimestamp(rideData)}',
+          );
+        }
+        final skipReason = rideData == null
+            ? 'payload_not_map'
+            : _popupServerSkipReason(
+                  rideId,
+                  rideData,
+                  marketDiscoveryStage: true,
+                ) ??
+                '';
+        final qualifies = rideData != null &&
+            DriverFeatureFlags.activeRequestServiceTypes.contains(
+              _serviceTypeKey(rideData['service_type']),
+            ) &&
+            _driverCanAcceptServiceType(
+              _serviceTypeKey(rideData['service_type']),
+            ) &&
+            skipReason.isEmpty;
+        if (!qualifies) {
+          final expectedMarket = driverCity;
+          final actualMarket =
+              rideData == null ? '' : (_rideMarketFromData(rideData) ?? '');
+          final rawStatus = rideData == null
+              ? ''
+              : _valueAsText(rideData[RtdbRideRequestFields.status]);
+          final rawTripState = rideData == null
+              ? ''
+              : _valueAsText(rideData[RtdbRideRequestFields.tripState]);
+          final rawDriverId = rideData == null
+              ? ''
+              : _valueAsText(rideData[RtdbRideRequestFields.driverId]);
+          final rawRequestExpires = rideData == null
+              ? ''
+              : _valueAsText(rideData['request_expires_at']);
+          final rawExpires =
+              rideData == null ? '' : _valueAsText(rideData['expires_at']);
+          final nowMs = DateTime.now().millisecondsSinceEpoch;
+          final expiryInfo = rideData == null
+              ? (value: 0, field: 'none')
+              : _rideExpiryInfo(rideData);
+          final expiresEval = expiryInfo.value;
+          _logRideReq(
+            '[DRIVER_DISCOVERY_REJECT] rideId=$rideId reason='
+            '${skipReason.isEmpty ? 'service_type_not_enabled_for_driver' : skipReason} '
+            'market_expected=$expectedMarket market_actual=$actualMarket '
+            'status=$rawStatus trip_state=$rawTripState driver_id=$rawDriverId '
+            'request_expires_at=$rawRequestExpires '
+            'expires_at=$rawExpires expires_eval_ms=$expiresEval now_ms=$nowMs '
+            'delta_ms=${expiresEval > 0 ? nowMs - expiresEval : -1} '
+            'chosen_expiry_field=${expiryInfo.field}',
+          );
         } else {
-          final keys = activeOpenRideMap.keys.toList(growable: false);
-          const maxKeys = 24;
-          final shown = keys.length <= maxKeys
-              ? keys.join(',')
-              : '${keys.take(maxKeys).join(',')},+${keys.length - maxKeys}_more';
-          _logDriverReq('candidateRideId=$shown');
+          _logRideReq('[DRIVER_DISCOVERY_ACCEPT] rideId=$rideId');
+          debugPrint(
+            '[DRIVER_REQUEST_RECEIVED] rideId=$rideId '
+            'market=${_rideMarketFromData(rideData) ?? ''}',
+          );
         }
-
-        _logReqDebug(
-          'local currentRideId=${_currentRideId ?? 'null'} '
-          'driverActiveRideId=${_driverActiveRideId ?? 'null'} '
-          'popupOpen=$_popupOpen hasActivePopup=$_hasActivePopup',
+        _logRideReq(
+          'ride discovery evaluation rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason} source=$source',
         );
+        _logRideReq(
+          '[MATCH_DEBUG][DRIVER_LISTENER] rideId=$rideId source=$source '
+          'status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason}',
+        );
+        _logReqDebug(
+          'ride eval rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason}',
+        );
+        if (qualifies) {
+          activeOpenRideMap[rideId] = rideData;
+        }
+      }
 
-        var reqDebugChild = 0;
-        const reqDebugChildMax = 50;
+      _logReqDebug(
+        'snapshot count=${rideMap.length} activeOpen=${activeOpenRideMap.length} market=$driverCity',
+      );
+      _logDriverReq(
+        'snapshotCount=${rideMap.length} activeOpenSnapshotCount=${activeOpenRideMap.length} source=$source',
+      );
+      if (activeOpenRideMap.isEmpty) {
+        _logDriverReq('candidateRideId=(none)');
+      } else {
+        final keys = activeOpenRideMap.keys.toList(growable: false);
+        const maxKeys = 24;
+        final shown = keys.length <= maxKeys
+            ? keys.join(',')
+            : '${keys.take(maxKeys).join(',')},+${keys.length - maxKeys}_more';
+        _logDriverReq('candidateRideId=$shown');
+      }
+
+      _logReqDebug(
+        'local currentRideId=${_currentRideId ?? 'null'} '
+        'driverActiveRideId=${_driverActiveRideId ?? 'null'} '
+        'popupOpen=$_popupOpen hasActivePopup=$_hasActivePopup',
+      );
+
+      var reqDebugChild = 0;
+      const reqDebugChildMax = 50;
+      for (final entry in activeOpenRideMap.entries) {
+        if (reqDebugChild >= reqDebugChildMax) {
+          _logReqDebug(
+            'candidate (+${activeOpenRideMap.length - reqDebugChildMax} more children not logged)',
+          );
+          break;
+        }
+        reqDebugChild += 1;
+        final cm = _asStringDynamicMap(entry.value);
+        if (cm == null) {
+          _logReqDebug(
+            'candidate rideId=${entry.key} status=(non-map) tripState=(non-map) '
+            'driverId=(non-map) market=(non-map) serviceType=(non-map)',
+          );
+          continue;
+        }
+        _logReqDebug(
+          'candidate rideId=${entry.key} '
+          'status=${_valueAsText(cm['status'])} '
+          'tripState=${_valueAsText(cm['trip_state'])} '
+          'driverId=${_valueAsText(cm['driver_id'])} '
+          'market=${_valueAsText(cm['market'])} '
+          'serviceType=${_valueAsText(cm['service_type'])}',
+        );
+      }
+
+      _logRideReq(
+        'request listener snapshot source=$source rawChildCount=${rideMap.length} activeOpenCount=${activeOpenRideMap.length} market=$driverCity',
+      );
+      _logRideReq(
+        '[DRIVER_DISCOVERY_SNAPSHOT] source=$source rawChildCount=${rideMap.length} '
+        'activeOpenCount=${activeOpenRideMap.length} market=$driverCity',
+      );
+      _logPopup(
+          'snapshot received raw=${rideMap.length} activeOpen=${activeOpenRideMap.length}');
+      _logDiscoveryChain(
+        'snapshot received raw=${rideMap.length} activeOpen=${activeOpenRideMap.length}',
+      );
+      if (activeOpenRideMap.isEmpty) {
+        _logDiscoveryChain(
+          'snapshot_empty query_market_exact=$driverCity '
+          '(compare byte-for-byte to ride_requests/{rideId}/market in Firebase console)',
+        );
+      } else {
+        var loggedChildren = 0;
+        const maxChildLogs = 30;
         for (final entry in activeOpenRideMap.entries) {
-          if (reqDebugChild >= reqDebugChildMax) {
-            _logReqDebug(
-              'candidate (+${activeOpenRideMap.length - reqDebugChildMax} more children not logged)',
+          if (loggedChildren >= maxChildLogs) {
+            _logDiscoveryChain(
+              'snapshot_children_truncated total=${activeOpenRideMap.length} logged=$maxChildLogs',
             );
             break;
           }
-          reqDebugChild += 1;
-          final cm = _asStringDynamicMap(entry.value);
-          if (cm == null) {
-            _logReqDebug(
-              'candidate rideId=${entry.key} status=(non-map) tripState=(non-map) '
-              'driverId=(non-map) market=(non-map) serviceType=(non-map)',
-            );
-            continue;
-          }
-          _logReqDebug(
-            'candidate rideId=${entry.key} '
-            'status=${_valueAsText(cm['status'])} '
-            'tripState=${_valueAsText(cm['trip_state'])} '
-            'driverId=${_valueAsText(cm['driver_id'])} '
-            'market=${_valueAsText(cm['market'])} '
-            'serviceType=${_valueAsText(cm['service_type'])}',
-          );
-        }
-
-        _logRideReq(
-          'request listener snapshot source=$source rawChildCount=${rideMap.length} activeOpenCount=${activeOpenRideMap.length} market=$driverCity',
-        );
-        _logRideReq(
-          '[DRIVER_DISCOVERY_SNAPSHOT] source=$source rawChildCount=${rideMap.length} '
-          'activeOpenCount=${activeOpenRideMap.length} market=$driverCity',
-        );
-        _logPopup('snapshot received raw=${rideMap.length} activeOpen=${activeOpenRideMap.length}');
-        _logDiscoveryChain(
-          'snapshot received raw=${rideMap.length} activeOpen=${activeOpenRideMap.length}',
-        );
-        if (activeOpenRideMap.isEmpty) {
+          loggedChildren += 1;
+          final rawChild = entry.value;
+          final childMap = _asStringDynamicMap(rawChild);
+          final cm = childMap == null ? '?' : _valueAsText(childMap['market']);
+          final cs = childMap == null ? '?' : _valueAsText(childMap['status']);
+          final cst =
+              childMap == null ? '?' : _valueAsText(childMap['trip_state']);
+          final csrv =
+              childMap == null ? '?' : _valueAsText(childMap['service_type']);
           _logDiscoveryChain(
-            'snapshot_empty query_market_exact=$driverCity '
-            '(compare byte-for-byte to ride_requests/{rideId}/market in Firebase console)',
+            'snapshot_child rideId=${entry.key} market=$cm status=$cs '
+            'trip_state=$cst service_type=$csrv',
           );
-        } else {
-          var loggedChildren = 0;
-          const maxChildLogs = 30;
-          for (final entry in activeOpenRideMap.entries) {
-            if (loggedChildren >= maxChildLogs) {
-              _logDiscoveryChain(
-                'snapshot_children_truncated total=${activeOpenRideMap.length} logged=$maxChildLogs',
-              );
-              break;
-            }
-            loggedChildren += 1;
-            final rawChild = entry.value;
-            final childMap = _asStringDynamicMap(rawChild);
-            final cm = childMap == null ? '?' : _valueAsText(childMap['market']);
-            final cs = childMap == null ? '?' : _valueAsText(childMap['status']);
-            final cst =
-                childMap == null ? '?' : _valueAsText(childMap['trip_state']);
-            final csrv = childMap == null
-                ? '?'
-                : _valueAsText(childMap['service_type']);
-            _logDiscoveryChain(
-              'snapshot_child rideId=${entry.key} market=$cm status=$cs '
-              'trip_state=$cst service_type=$csrv',
+        }
+      }
+
+      if (!_isOnline) {
+        _logDriverReq('skippedReason=driver_offline source=$source');
+        _logRideReq('snapshot ignored driver offline source=$source');
+        _logPopup('skipped reason=driver_offline');
+        _logDiscoveryChain('skipped reason=driver_offline source=$source');
+        return;
+      }
+
+      final activePopupRideId = _activePopupRideId;
+      if ((_popupOpen || _hasActivePopup) &&
+          activePopupRideId != null &&
+          _acceptingPopupRideId != activePopupRideId) {
+        final aid = activePopupRideId.trim();
+        final skipUnavailableDismissal =
+            _foreverSuppressedRidePopupIds.contains(aid) ||
+                _terminalSelfAcceptedRideIds.contains(aid) ||
+                _currentRideId == activePopupRideId ||
+                _driverActiveRideId == activePopupRideId;
+        if (skipUnavailableDismissal) {
+          _logRideReq(
+            '[MATCH_DEBUG][UNAVAILABLE_RENDER_BLOCKED] rideId=$activePopupRideId '
+            'forever=${_foreverSuppressedRidePopupIds.contains(aid)} '
+            'terminal=${_terminalSelfAcceptedRideIds.contains(aid)} '
+            'currentRide=$_currentRideId driverActive=$_driverActiveRideId',
+          );
+          if (_terminalSelfAcceptedRideIds.contains(aid)) {
+            _logRideReq(
+              '[MATCH_DEBUG][UNAVAILABLE_SKIPPED_SELF_ACCEPTED] rideId=$activePopupRideId '
+              'source=discovery_popup_dismissal_guard',
             );
           }
-        }
-
-        if (!_isOnline) {
-          _logDriverReq('skippedReason=driver_offline source=$source');
-          _logRideReq('snapshot ignored driver offline source=$source');
-          _logPopup('skipped reason=driver_offline');
-          _logDiscoveryChain('skipped reason=driver_offline source=$source');
-          return;
-        }
-
-        final activePopupRideId = _activePopupRideId;
-        if ((_popupOpen || _hasActivePopup) &&
-            activePopupRideId != null &&
-            _acceptingPopupRideId != activePopupRideId) {
-          final aid = activePopupRideId.trim();
-          final skipUnavailableDismissal =
-              _foreverSuppressedRidePopupIds.contains(aid) ||
-                  _terminalSelfAcceptedRideIds.contains(aid) ||
-                  _currentRideId == activePopupRideId ||
-                  _driverActiveRideId == activePopupRideId;
-          if (skipUnavailableDismissal) {
+        } else {
+          var activePopupRideData =
+              _asStringDynamicMap(rideMap[activePopupRideId]);
+          if (activePopupRideData == null) {
             _logRideReq(
-              '[MATCH_DEBUG][UNAVAILABLE_RENDER_BLOCKED] rideId=$activePopupRideId '
-              'forever=${_foreverSuppressedRidePopupIds.contains(aid)} '
-              'terminal=${_terminalSelfAcceptedRideIds.contains(aid)} '
-              'currentRide=$_currentRideId driverActive=$_driverActiveRideId',
+              '[DRIVER_DISCOVERY_TRACE] skip direct read path=ride_requests/$activePopupRideId reason=query_only_rules',
             );
-            if (_terminalSelfAcceptedRideIds.contains(aid)) {
-              _logRideReq(
-                '[MATCH_DEBUG][UNAVAILABLE_SKIPPED_SELF_ACCEPTED] rideId=$activePopupRideId '
-                'source=discovery_popup_dismissal_guard',
-              );
-            }
-          } else {
-            var activePopupRideData =
-                _asStringDynamicMap(rideMap[activePopupRideId]);
-            if (activePopupRideData == null) {
-              _logRideReq(
-                '[DRIVER_DISCOVERY_TRACE] skip direct read path=ride_requests/$activePopupRideId reason=query_only_rules',
-              );
-            }
-            final activePopupRide = _matchRideForPopup(
+          }
+          final activePopupRide = _matchRideForPopup(
+            activePopupRideId,
+            activePopupRideData,
+            ignoreLocalState: true,
+          );
+          if (activePopupRide == null && mounted) {
+            final dismissalReason = _popupServerSkipReason(
               activePopupRideId,
               activePopupRideData,
-              ignoreLocalState: true,
             );
-            if (activePopupRide == null && mounted) {
-              final dismissalReason = _popupServerSkipReason(
-                activePopupRideId,
-                activePopupRideData,
-              );
-              if (!_shouldDismissPopupForServerReason(dismissalReason)) {
-                _logRtdb(
-                  'popup kept open rideId=$activePopupRideId reason=${dismissalReason ?? 'transient'}',
-                );
-                return;
-              }
-              if (_popupDismissedRideId != activePopupRideId) {
-                _popupDismissedRideId = activePopupRideId;
-                _popupDismissedReason = dismissalReason;
-                if (_rideBelongsToAnotherDriver(activePopupRideData)) {
-                  _logRtdb('accept lost rideId=$activePopupRideId');
-                }
-              }
-              if (!mounted) {
-                return;
-              }
-              unawaited(Navigator.of(context, rootNavigator: true).maybePop());
-            }
-          }
-        }
-
-        // Do not gate on [_rideStatus] here: stale non-idle status must not block
-        // incoming offers. Active-trip blocking was removed so drivers still receive
-        // the open-pool stream while assigned (queue handles concurrent popups).
-
-        final candidates = <_MatchedRideRequest>[];
-        var skipLogBudget = 6;
-        var seenLogBudget = 8;
-        for (final entry in activeOpenRideMap.entries) {
-          final entryData = entry.value;
-          if (seenLogBudget > 0) {
-            seenLogBudget -= 1;
-            _logRideReq('candidate seen rideId=${entry.key} service=ride');
-          }
-          _maybeUnsuppressOpenPoolRide(entry.key, entryData);
-          final matchedRide = _matchRideForPopup(
-            entry.key,
-            entry.value,
-            logCandidate: true,
-            marketDiscoveryCandidate: true,
-          );
-          if (matchedRide != null) {
-            final mkt = _valueAsText(entryData['market']);
-            final st = _valueAsText(entryData['status']);
-            final did = _valueAsText(entryData['driver_id']);
-            _logPopup(
-              'candidate rideId=${entry.key} status=$st market=$mkt driverId=$did',
-            );
-            _logDiscoveryChain(
-              'candidate rideId=${entry.key} status=$st market=$mkt driverId=$did',
-            );
-            candidates.add(matchedRide);
-          } else {
-            final serverSkip = _popupServerSkipReason(
-              entry.key,
-              entryData,
-              marketDiscoveryStage: true,
-            );
-            final localSkip = _popupLocalSkipReason(entry.key);
-            final skipReason = localSkip ?? serverSkip ?? 'unknown';
-            _logReqDebug('skip rideId=${entry.key} reason=$skipReason');
-            if (skipLogBudget > 0) {
-              skipLogBudget -= 1;
-              _logRideReq(
-                'candidate skipped rideId=${entry.key} server=${serverSkip ?? 'ok'} '
-                'local=${localSkip ?? 'ok'}',
-              );
-              _logPopup('skipped reason=$skipReason');
-              _logDiscoveryChain(
-                'candidate_filtered rideId=${entry.key} skipped reason=$skipReason',
-              );
-            }
-          }
-        }
-
-        if (candidates.isEmpty) {
-          if (activeOpenRideMap.isNotEmpty) {
-            for (final entry in activeOpenRideMap.entries) {
-              final ed = entry.value;
-              final skip = _popupServerSkipReason(
-                entry.key,
-                ed,
-                marketDiscoveryStage: true,
-              );
+            if (!_shouldDismissPopupForServerReason(dismissalReason)) {
               _logRtdb(
-                'dispatch skip sample rideId=${entry.key} reason=${skip ?? 'unknown'} driverCity=$driverCity driverLoc=${_driverLocation.latitude},${_driverLocation.longitude}',
+                'popup kept open rideId=$activePopupRideId reason=${dismissalReason ?? 'transient'}',
               );
-              _logRideReq(
-                'no dispatchable candidates (sample) rideId=${entry.key} reason=${skip ?? 'unknown'}',
-              );
-              break;
+              return;
             }
+            if (_popupDismissedRideId != activePopupRideId) {
+              _popupDismissedRideId = activePopupRideId;
+              _popupDismissedReason = dismissalReason;
+              if (_rideBelongsToAnotherDriver(activePopupRideData)) {
+                _logRtdb('accept lost rideId=$activePopupRideId');
+              }
+            }
+            if (!mounted) {
+              return;
+            }
+            unawaited(Navigator.of(context, rootNavigator: true).maybePop());
           }
-          _logRideReq('no candidates after filter source=$source');
-          if (activeOpenRideMap.isEmpty) {
-            _logDriverReq('skippedReason=snapshot_empty source=$source');
-          } else {
-            _logDriverReq(
-              'skippedReason=no_dispatchable_candidates source=$source',
-            );
-          }
-          _logListenerStillActiveWaitingForFreshRides();
-          return;
         }
+      }
 
-        candidates.sort((a, b) {
-          if (a.sameArea != b.sameArea) {
-            return a.sameArea ? -1 : 1;
-          }
-          final distanceCompare = a.distanceMeters.compareTo(b.distanceMeters);
-          if (distanceCompare != 0) {
-            return distanceCompare;
-          }
-          return a.createdAt.compareTo(b.createdAt);
-        });
-        final matchedRide = candidates.first;
-        _logRtdb(
-          'candidate request found rideId=${matchedRide.rideId} city=$driverCity serviceType=${matchedRide.serviceType} source=$source',
-        );
+      // Do not gate on [_rideStatus] here: stale non-idle status must not block
+      // incoming offers. Active-trip blocking was removed so drivers still receive
+      // the open-pool stream while assigned (queue handles concurrent popups).
 
-        final latestDiscoverySnapshotValue = matchedRide.rideData;
-        final recheckedRide = _matchRideForPopup(
-          matchedRide.rideId,
-          latestDiscoverySnapshotValue,
-          logCandidate: false,
+      final candidates = <_MatchedRideRequest>[];
+      var skipLogBudget = 6;
+      var seenLogBudget = 8;
+      for (final entry in activeOpenRideMap.entries) {
+        final entryData = entry.value;
+        if (seenLogBudget > 0) {
+          seenLogBudget -= 1;
+          _logRideReq('candidate seen rideId=${entry.key} service=ride');
+        }
+        _maybeUnsuppressOpenPoolRide(entry.key, entryData);
+        final matchedRide = _matchRideForPopup(
+          entry.key,
+          entry.value,
+          logCandidate: true,
           marketDiscoveryCandidate: true,
         );
-        if (recheckedRide == null) {
-          _logRidePopup(
-            'skip rideId=${matchedRide.rideId} reason=pre_show_recheck_failed',
-          );
-          _logDriverReq(
-            'skippedReason=pre_show_recheck_failed rideId=${matchedRide.rideId} source=$source',
-          );
-          _logRideReq(
-            'popup blocked pre-show recheck failed rideId=${matchedRide.rideId} source=$source',
-          );
-          _logPopup('skipped reason=pre_show_recheck_failed');
-          _logDiscoveryChain(
-            'skipped reason=pre_show_recheck_failed rideId=${matchedRide.rideId}',
-          );
-          _logRideRequestDiscoveryRecheckSuppressed(
-            matchedRide.rideId,
-            _asStringDynamicMap(latestDiscoverySnapshotValue),
-          );
-          _logListenerStillActiveWaitingForFreshRides();
-          return;
-        }
-
-        for (var i = 1; i < candidates.length; i++) {
-          _enqueueRideRequestPopupIfIdleSlot(candidates[i]);
-        }
-        if (_popupOpen || _hasActivePopup) {
-          _enqueueRideRequestPopupIfIdleSlot(recheckedRide);
-          _logDriverReq(
-            'skippedReason=popup_busy_queued rideId=${recheckedRide.rideId} '
-            'open=$_popupOpen hasActive=$_hasActivePopup '
-            'queue_depth=${_rideRequestPopupQueue.length} source=$source',
-          );
-          _logRideReq(
-            '[DISCOVERY_QUEUE] deferred primary rideId=${recheckedRide.rideId} '
-            'queue_depth=${_rideRequestPopupQueue.length} source=$source',
-          );
+        if (matchedRide != null) {
+          final mkt = _valueAsText(entryData['market']);
+          final st = _valueAsText(entryData['status']);
+          final did = _valueAsText(entryData['driver_id']);
           _logPopup(
-            'queued reason=popup_busy rideId=${recheckedRide.rideId} '
-            'depth=${_rideRequestPopupQueue.length}',
+            'candidate rideId=${entry.key} status=$st market=$mkt driverId=$did',
           );
           _logDiscoveryChain(
-            'snapshot_queued popup_busy rideId=${recheckedRide.rideId} '
-            'depth=${_rideRequestPopupQueue.length} source=$source',
+            'candidate rideId=${entry.key} status=$st market=$mkt driverId=$did',
           );
-          _logListenerStillActiveWaitingForFreshRides();
-          return;
-        }
-
-        _currentCandidateRideId = recheckedRide.rideId;
-        _logRideReq(
-          'popup opening rideId=${recheckedRide.rideId} source=$source (calling showRideRequestPopup)',
-        );
-        _logCanonicalRideEvent(
-          eventName: 'ride_offered',
-          rideId: recheckedRide.rideId,
-          rideData: recheckedRide.rideData,
-        );
-        _logReqDebug('popup OPEN rideId=${recheckedRide.rideId}');
-        _logPopupFix('opening popup rideId=${recheckedRide.rideId}');
-        _logPopup('opening rideId=${recheckedRide.rideId}');
-        _logDiscoveryChain('popup opening rideId=${recheckedRide.rideId}');
-        if (_ridePopupOpenPipelineLocked) {
-          _enqueueRideRequestPopupIfIdleSlot(recheckedRide);
-          _logRidePopup(
-            'queued rideId=${recheckedRide.rideId} reason=pipeline_locked',
-          );
-          if (_currentCandidateRideId == recheckedRide.rideId) {
-            _currentCandidateRideId = null;
-          }
+          candidates.add(matchedRide);
         } else {
-          _ridePopupOpenPipelineLocked = true;
-          try {
-            await showRideRequestPopup(recheckedRide);
-          } finally {
-            _ridePopupOpenPipelineLocked = false;
+          final serverSkip = _popupServerSkipReason(
+            entry.key,
+            entryData,
+            marketDiscoveryStage: true,
+          );
+          final localSkip = _popupLocalSkipReason(entry.key);
+          final skipReason = localSkip ?? serverSkip ?? 'unknown';
+          _logReqDebug('skip rideId=${entry.key} reason=$skipReason');
+          if (skipLogBudget > 0) {
+            skipLogBudget -= 1;
+            _logRideReq(
+              'candidate skipped rideId=${entry.key} server=${serverSkip ?? 'ok'} '
+              'local=${localSkip ?? 'ok'}',
+            );
+            _logPopup('skipped reason=$skipReason');
+            _logDiscoveryChain(
+              'candidate_filtered rideId=${entry.key} skipped reason=$skipReason',
+            );
           }
         }
+      }
+
+      if (candidates.isEmpty) {
+        if (activeOpenRideMap.isNotEmpty) {
+          for (final entry in activeOpenRideMap.entries) {
+            final ed = entry.value;
+            final skip = _popupServerSkipReason(
+              entry.key,
+              ed,
+              marketDiscoveryStage: true,
+            );
+            _logRtdb(
+              'dispatch skip sample rideId=${entry.key} reason=${skip ?? 'unknown'} driverCity=$driverCity driverLoc=${_driverLocation.latitude},${_driverLocation.longitude}',
+            );
+            _logRideReq(
+              'no dispatchable candidates (sample) rideId=${entry.key} reason=${skip ?? 'unknown'}',
+            );
+            break;
+          }
+        }
+        _logRideReq('no candidates after filter source=$source');
+        if (activeOpenRideMap.isEmpty) {
+          _logDriverReq('skippedReason=snapshot_empty source=$source');
+        } else {
+          _logDriverReq(
+            'skippedReason=no_dispatchable_candidates source=$source',
+          );
+        }
+        _logListenerStillActiveWaitingForFreshRides();
+        return;
+      }
+
+      candidates.sort((a, b) {
+        if (a.sameArea != b.sameArea) {
+          return a.sameArea ? -1 : 1;
+        }
+        final distanceCompare = a.distanceMeters.compareTo(b.distanceMeters);
+        if (distanceCompare != 0) {
+          return distanceCompare;
+        }
+        return a.createdAt.compareTo(b.createdAt);
+      });
+      final matchedRide = candidates.first;
+      _logRtdb(
+        'candidate request found rideId=${matchedRide.rideId} city=$driverCity serviceType=${matchedRide.serviceType} source=$source',
+      );
+
+      final latestDiscoverySnapshotValue = matchedRide.rideData;
+      final recheckedRide = _matchRideForPopup(
+        matchedRide.rideId,
+        latestDiscoverySnapshotValue,
+        logCandidate: false,
+        marketDiscoveryCandidate: true,
+      );
+      if (recheckedRide == null) {
+        _logRidePopup(
+          'skip rideId=${matchedRide.rideId} reason=pre_show_recheck_failed',
+        );
+        _logDriverReq(
+          'skippedReason=pre_show_recheck_failed rideId=${matchedRide.rideId} source=$source',
+        );
+        _logRideReq(
+          'popup blocked pre-show recheck failed rideId=${matchedRide.rideId} source=$source',
+        );
+        _logPopup('skipped reason=pre_show_recheck_failed');
+        _logDiscoveryChain(
+          'skipped reason=pre_show_recheck_failed rideId=${matchedRide.rideId}',
+        );
+        _logRideRequestDiscoveryRecheckSuppressed(
+          matchedRide.rideId,
+          _asStringDynamicMap(latestDiscoverySnapshotValue),
+        );
+        _logListenerStillActiveWaitingForFreshRides();
+        return;
+      }
+
+      for (var i = 1; i < candidates.length; i++) {
+        _enqueueRideRequestPopupIfIdleSlot(candidates[i]);
+      }
+      if (_popupOpen || _hasActivePopup) {
+        _enqueueRideRequestPopupIfIdleSlot(recheckedRide);
+        _logDriverReq(
+          'skippedReason=popup_busy_queued rideId=${recheckedRide.rideId} '
+          'open=$_popupOpen hasActive=$_hasActivePopup '
+          'queue_depth=${_rideRequestPopupQueue.length} source=$source',
+        );
+        _logRideReq(
+          '[DISCOVERY_QUEUE] deferred primary rideId=${recheckedRide.rideId} '
+          'queue_depth=${_rideRequestPopupQueue.length} source=$source',
+        );
+        _logPopup(
+          'queued reason=popup_busy rideId=${recheckedRide.rideId} '
+          'depth=${_rideRequestPopupQueue.length}',
+        );
+        _logDiscoveryChain(
+          'snapshot_queued popup_busy rideId=${recheckedRide.rideId} '
+          'depth=${_rideRequestPopupQueue.length} source=$source',
+        );
+        _logListenerStillActiveWaitingForFreshRides();
+        return;
+      }
+
+      _currentCandidateRideId = recheckedRide.rideId;
+      _logRideReq(
+        'popup opening rideId=${recheckedRide.rideId} source=$source (calling showRideRequestPopup)',
+      );
+      _logCanonicalRideEvent(
+        eventName: 'ride_offered',
+        rideId: recheckedRide.rideId,
+        rideData: recheckedRide.rideData,
+      );
+      _logReqDebug('popup OPEN rideId=${recheckedRide.rideId}');
+      _logPopupFix('opening popup rideId=${recheckedRide.rideId}');
+      _logPopup('opening rideId=${recheckedRide.rideId}');
+      _logDiscoveryChain('popup opening rideId=${recheckedRide.rideId}');
+      if (_ridePopupOpenPipelineLocked) {
+        _enqueueRideRequestPopupIfIdleSlot(recheckedRide);
+        _logRidePopup(
+          'queued rideId=${recheckedRide.rideId} reason=pipeline_locked',
+        );
+        if (_currentCandidateRideId == recheckedRide.rideId) {
+          _currentCandidateRideId = null;
+        }
+      } else {
+        _ridePopupOpenPipelineLocked = true;
+        try {
+          await showRideRequestPopup(recheckedRide);
+        } finally {
+          _ridePopupOpenPipelineLocked = false;
+        }
+      }
     }
 
     Future<void> queueSnapshotProcessing(
@@ -10109,15 +10396,14 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       required String source,
       required int listenerToken,
     }) async {
-      snapshotProcessingChain = snapshotProcessingChain
-          .catchError((Object _) {})
-          .then(
-            (_) => processSnapshot(
-              snapshot,
-              source: source,
-              listenerToken: listenerToken,
-            ),
-          );
+      snapshotProcessingChain =
+          snapshotProcessingChain.catchError((Object _) {}).then(
+                (_) => processSnapshot(
+                  snapshot,
+                  source: source,
+                  listenerToken: listenerToken,
+                ),
+              );
       await snapshotProcessingChain;
     }
 
@@ -10223,6 +10509,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logRideReq(
         'request listener STREAM subscribed market=$driverCity reason=$reason token=$listenerToken',
       );
+      _socketStatus = 'stream_connected';
       debugPrint(
         '[RTDB_DISCOVERY] STREAM_SUBSCRIBE path=ride_requests?orderByChild=market_pool&equalTo=$driverCity '
         'market=$driverCity authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'}',
@@ -10235,6 +10522,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         (event) async {
           _clearDiscoveryPermissionDeniedNotice(source: 'listener_event');
           _rideDiscoveryListenerHealthy = true;
+          _socketStatus = 'stream_connected';
+          _lastRideStreamEventAt = DateTime.now();
           try {
             await queueSnapshotProcessing(
               event.snapshot,
@@ -10263,6 +10552,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           final code = _firebaseErrorCode(error);
           final message = _firebaseErrorMessage(error);
           _rideDiscoveryListenerHealthy = false;
+          _socketStatus = 'stream_error';
           debugPrint(
             '[DRIVER_BACKEND] op=ride_discovery_stream_error authUid=$uid '
             'driverProfilePath=${uid == 'none' ? 'drivers/(none)' : driverProfilePath(uid)} '
@@ -10288,7 +10578,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
               'error=$error code=$code message=$message '
               'path=ride_requests orderByChild=market_pool equalTo=$driverCity',
             );
-            _logDriverReq('skippedReason=rtdb_permission_denied_stream error=$error');
+            _logDriverReq(
+                'skippedReason=rtdb_permission_denied_stream error=$error');
             unawaited(
               _cancelRideRequestListener(
                 reason: 'permission_denied_stream_market_$driverCity',
@@ -10349,6 +10640,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         'reason=$reason prime_get=skipped_ios_safe',
       );
       _rideDiscoveryListenerHealthy = true;
+      _socketStatus = 'stream_connected';
       _logRideReq(
         '[MATCH_DEBUG][DRIVER_LISTENER_ATTACH_OK] market=$driverCity token=$listenerToken',
       );
@@ -10363,7 +10655,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logRideReq('[DRIVER_DISCOVERY_TRACE] listener attach OK');
       _clearDiscoveryPermissionDeniedNotice(source: 'listener_attach_success');
       _logPopup('online attach success');
-      _logDiscoveryChain('online attach success market=$driverCity reason=$reason');
+      _logDiscoveryChain(
+          'online attach success market=$driverCity reason=$reason');
       print('RIDE_DISCOVERY_ATTACH_SUCCESS');
       return true;
     } catch (error) {
@@ -10596,7 +10889,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     var popupTimedOut = false;
     var remainingSeconds = _kRidePopupCountdownSeconds;
     var isAccepting = false;
-      var rideReserved = rideAlreadyReserved;
+    var rideReserved = rideAlreadyReserved;
     var rideAccepted = false;
     StateSetter? dialogSetState;
 
@@ -10683,13 +10976,18 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         verification,
         popupRide.serviceType,
       );
-      final canAcceptService = serviceSupported && serviceApproved;
+      final serviceMatchedDriverType =
+          _driverCanAcceptServiceType(popupRide.serviceType);
+      final canAcceptService =
+          serviceSupported && serviceApproved && serviceMatchedDriverType;
       final serviceRestrictionMessage = !serviceSupported
           ? '${_serviceTypeLabel(popupRide.serviceType)} is not enabled for drivers yet. You can close this request safely.'
-          : driverServiceRestrictionMessage(
-              verification,
-              popupRide.serviceType,
-            );
+          : !serviceMatchedDriverType
+              ? 'This request does not match your selected driver service type.'
+              : driverServiceRestrictionMessage(
+                  verification,
+                  popupRide.serviceType,
+                );
       final popupHeadline = fareValue > 0
           ? '₦$fareValue'
           : _serviceTypeLabel(popupRide.serviceType);
@@ -11230,6 +11528,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
                               _logRtdb(
                                 'accept tapped rideId=${activePopupRide.rideId} driverId=$_effectiveDriverId',
                               );
+                              _logRideReq(
+                                '[ACCEPT_API_STARTED] rideId=${activePopupRide.rideId} driverId=$_effectiveDriverId',
+                              );
+                              _setApiStatus('loading');
                               _clearRidePopupTimer();
                               setDialogState(() {});
                               final accepted = await _acceptRide(
@@ -11238,6 +11540,32 @@ class _DriverMapScreenState extends State<DriverMapScreen>
                                 car: car,
                                 plate: plate,
                                 acceptRequestedAt: acceptRequestedAt,
+                              ).timeout(
+                                const Duration(seconds: 20),
+                                onTimeout: () {
+                                  _logRideReq(
+                                    '[ACCEPT_API_FAILURE] rideId=${activePopupRide.rideId} reason=timeout',
+                                  );
+                                  _showSnackBarSafely(
+                                    const SnackBar(
+                                      content: Text(
+                                        'Accept is taking too long. Please try again.',
+                                      ),
+                                    ),
+                                  );
+                                  return false;
+                                },
+                              );
+                              _logRideReq(
+                                accepted
+                                    ? '[ACCEPT_API_SUCCESS] rideId=${activePopupRide.rideId}'
+                                    : '[ACCEPT_API_FAILURE] rideId=${activePopupRide.rideId}',
+                              );
+                              _setApiStatus(
+                                accepted ? 'success' : 'failed',
+                                errorMessage: accepted
+                                    ? null
+                                    : 'Could not accept request.',
                               );
                               if (!dialogContext.mounted) {
                                 return;
@@ -11247,6 +11575,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
                                   '[MATCH_DEBUG][POPUP_DISMISSED_AFTER_ACCEPT] '
                                   'rideId=${activePopupRide.rideId}',
                                 );
+                              } else {
+                                isAccepting = false;
+                                setDialogState(() {});
+                                return;
                               }
                               Navigator.of(dialogContext).pop(
                                 accepted
@@ -11437,16 +11769,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final ref = _rideRequestsRef.child(rideId);
     final effectiveAcceptRequestedAt =
         acceptRequestedAt ?? DateTime.now().millisecondsSinceEpoch;
-    final resolvedDriverName = driverName?.trim().isNotEmpty == true
-        ? driverName!.trim()
-        : widget.driverName.trim().isNotEmpty
-            ? widget.driverName.trim()
-            : 'Driver';
-    final resolvedCar =
-        car?.trim().isNotEmpty == true ? car!.trim() : widget.car.trim();
-    final resolvedPlate =
-        plate?.trim().isNotEmpty == true ? plate!.trim() : widget.plate.trim();
-
     if (_effectiveDriverId.isEmpty ||
         FirebaseAuth.instance.currentUser?.uid != _effectiveDriverId ||
         !_isOnline) {
@@ -11478,104 +11800,115 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
     _log(
       '[ACCEPT] start rideId=$rideId driverId=$_effectiveDriverId '
-      'sessionWarning=${availabilityInvalidReason ?? 'none'}',
+      'sessionWarning=${availabilityInvalidReason ?? 'none'} '
+      'acceptRequestedAt=$effectiveAcceptRequestedAt',
     );
     var acceptSucceeded = false;
     try {
+      final authUser = FirebaseAuth.instance.currentUser;
+      if (authUser == null) {
+        throw Exception('No authenticated user');
+      }
+      // Force a fresh ID token before callable invocation so backend context.auth
+      // is populated with current session credentials.
+      await authUser.getIdToken(true);
+      final driverId = authUser.uid.trim();
+      final driverSnapshot = await _driversRef.child(driverId).get();
+      final driverRecord = _asStringDynamicMap(driverSnapshot.value);
+      final storedUid = _valueAsText(driverRecord?['uid']);
+      final storedId = _valueAsText(driverRecord?['id']);
+      final driverProfileMatchesUid =
+          (storedUid.isEmpty || storedUid == driverId) &&
+              (storedId.isEmpty || storedId == driverId);
+      final callablePayload = <String, dynamic>{
+        'rideId': rideId,
+        'driverId': driverId,
+      };
+      _logRideReq(
+        '[ACCEPT_PRECHECK] authUid=${authUser.uid} effectiveDriverIdSent=$driverId '
+        'driverNodeExists=${driverSnapshot.exists} driverIdField=$storedId '
+        'driverUidField=$storedUid driverProfileMatchesUid=$driverProfileMatchesUid '
+        'payloadRideId=$rideId payloadDriverId=$driverId',
+      );
+      if (!driverSnapshot.exists ||
+          !driverProfileMatchesUid) {
+        _setApiStatus(
+          'failed',
+          errorMessage:
+              'Driver profile is not ready. Please refresh your account session.',
+        );
+        _showSnackBarSafely(
+          const SnackBar(
+            content: Text(
+              'Driver profile is not ready. Please refresh your account session.',
+            ),
+          ),
+        );
+        return false;
+      }
+      final preflightSnapshot = await ref.get();
+      final preflightRideData = _asStringDynamicMap(preflightSnapshot.value);
+      if (preflightRideData == null) {
+        _setApiStatus(
+          'failed',
+          errorMessage: 'This request is no longer available.',
+        );
+        return false;
+      }
+      final simulatedAccept = await _backendSimulation.acceptTrip(
+        BackendAcceptRequest(
+          rideId: rideId,
+          driverId: driverId,
+          driverServiceTypes: _effectiveDriverServiceTypes(),
+          rideSnapshot: preflightRideData,
+        ),
+      );
+      if (!simulatedAccept.ok) {
+        _setApiStatus('failed', errorMessage: simulatedAccept.message);
+        _showSnackBarSafely(SnackBar(content: Text(simulatedAccept.message)));
+        return false;
+      }
       String blockedReason = 'unknown';
       var acceptLockWasIdempotent = false;
-      final nowMs = DateTime.now().millisecondsSinceEpoch;
-      final startTimeoutAt =
-          nowMs + TripStateMachine.acceptedToStartTimeout.inMilliseconds;
       _logRideReq(
-        '[MATCH_DEBUG][ACCEPT_START] rideId=$rideId driverId=$_effectiveDriverId',
+        '[MATCH_DEBUG][ACCEPT_START] rideId=$rideId driverId=$driverId',
       );
       _logRideReq(
-        '[DRIVER_ACCEPT_START] rideId=$rideId driverId=$_effectiveDriverId',
+        '[DRIVER_ACCEPT_START] rideId=$rideId driverId=$driverId',
       );
       _logRideReq(
-        '[MATCH_DEBUG][ACCEPT_TX_BEGIN] rideId=$rideId driverId=$_effectiveDriverId',
+        '[MATCH_DEBUG][ACCEPT_TX_BEGIN] rideId=$rideId driverId=$driverId',
       );
       _logRideReq(
-        '[DRIVER_ACCEPT_TX] stage=begin rideId=$rideId driverId=$_effectiveDriverId',
+        '[DRIVER_ACCEPT_TX] stage=begin rideId=$rideId driverId=$driverId',
       );
-      final transactionResult = await ref.runTransaction((currentData) {
-        final current = _asStringDynamicMap(currentData);
-        if (current == null) {
-          blockedReason = 'ride_missing';
-          return rtdb.Transaction.abort();
-        }
+      _logRideReq(
+        'DRIVER_ACCEPT_API_START rideId=$rideId driverId=$driverId',
+      );
+      print('ACCEPT_CALL_PAYLOAD driverId=$driverId authUid=${authUser.uid}');
+      final functions = FirebaseFunctions.instanceFor(region: 'us-central1');
+      final callable = functions.httpsCallable('acceptRide');
+      final callableResult = await callable.call(callablePayload);
+      final callableResponse = _asStringDynamicMap(callableResult.data);
+      final acceptOk = callableResponse?['success'] == true;
+      blockedReason = _valueAsText(callableResponse?['reason']);
+      acceptLockWasIdempotent = callableResponse?['idempotent'] == true;
 
-        final currentCanonicalState =
-            TripStateMachine.canonicalStateFromSnapshot(current);
-        final currentDriverId = _valueAsText(current['driver_id']);
-        if (currentDriverId == _effectiveDriverId &&
-            TripStateMachine.isDriverActiveState(currentCanonicalState)) {
-          acceptLockWasIdempotent = true;
-          return rtdb.Transaction.success(Map<String, dynamic>.from(current));
-        }
-        if (!_isRideClaimableForDriverAccept(current)) {
-          blockedReason = _popupServerSkipReason(rideId, current) ??
-              'ride_not_claimable';
-          return rtdb.Transaction.abort();
-        }
-
-        final transitionUpdates = TripStateMachine.buildTransitionUpdate(
-          currentRide: current,
-          nextCanonicalState: TripLifecycleState.driverAccepted,
-          timestampValue: rtdb.ServerValue.timestamp,
-          transitionSource: 'driver_accept',
-          transitionActor: 'driver',
+      if (!acceptOk) {
+        _logRideReq(
+          'DRIVER_ACCEPT_API_FAIL rideId=$rideId reason=${blockedReason.isEmpty ? 'unknown' : blockedReason}',
         );
-        return rtdb.Transaction.success(
-          Map<String, dynamic>.from(current)
-            ..addAll(transitionUpdates)
-            ..addAll(<String, dynamic>{
-              'driver_id': _effectiveDriverId,
-              'accepted_driver_id': _effectiveDriverId,
-              'driver_name': resolvedDriverName,
-              'car': resolvedCar,
-              'plate': resolvedPlate,
-              // Rider / legacy UIs (and Firestore-era clients) often key off this phrase.
-              'rider_sync_status': 'driver_found',
-              'driver_match_confirmed_at': rtdb.ServerValue.timestamp,
-              // Leave the open-pool index; [service_area] / [city] still carry market.
-              'market': null,
-              'market_pool': null,
-              'accepted_at': rtdb.ServerValue.timestamp,
-              'assignment_expires_at': null,
-              'driver_response_timeout_at': null,
-              'assignment_timeout_ms': null,
-              'start_timeout_at': startTimeoutAt,
-              'route_log_timeout_at': null,
-              'has_started_route_checkpoints': false,
-              'route_log_trip_started_checkpoint_at': null,
-            }),
+      } else {
+        _logRideReq(
+          'DRIVER_ACCEPT_API_SUCCESS rideId=$rideId idempotent=$acceptLockWasIdempotent',
         );
-      }, applyLocally: false);
-
-      final latestRideData = transactionResult.committed
-          ? null
-          : _asStringDynamicMap(transactionResult.snapshot.value);
-      Map<String, dynamic>? ridePayload = transactionResult.committed
-          ? _asStringDynamicMap(transactionResult.snapshot.value)
-          : _rideAlreadyAcceptedByCurrentDriver(latestRideData)
-              ? latestRideData
-              : null;
-
-      if (!transactionResult.committed && ridePayload != null) {
-        acceptLockWasIdempotent = true;
       }
 
-      if (ridePayload == null &&
-          latestRideData != null &&
-          _rideAlreadyAcceptedByCurrentDriver(latestRideData)) {
-        _logRideReq(
-          '[MATCH_DEBUG][UNAVAILABLE_SUPPRESSED_ACCEPTED_DRIVER] rideId=$rideId '
-          'reason=client_tx_view_recover_server_accepted',
-        );
-        ridePayload = latestRideData;
-        acceptLockWasIdempotent = true;
+      final latestRideData = _asStringDynamicMap((await ref.get()).value);
+      Map<String, dynamic>? ridePayload = latestRideData;
+      if (ridePayload != null &&
+          _valueAsText(ridePayload['driver_id']) != driverId) {
+        ridePayload = null;
       }
 
       if (ridePayload == null) {
@@ -11592,15 +11925,15 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _logRtdb('accept blocked rideId=$rideId reason=$latestBlockedReason');
         _logRideReq(
           '[MATCH_DEBUG][ACCEPT_TX_ABORT] rideId=$rideId reason=$latestBlockedReason '
-          'rtdb_committed=${transactionResult.committed}',
+          'rtdb_committed=false',
         );
         _logRideReq(
           '[DRIVER_ACCEPT_TX] stage=abort rideId=$rideId reason=$latestBlockedReason '
-          'committed=${transactionResult.committed}',
+          'committed=false',
         );
         _logRideReq(
           '[MATCH_DEBUG][ACCEPT_LOCK_FAIL] rideId=$rideId reason=$latestBlockedReason '
-          'committed=${transactionResult.committed}',
+          'committed=false',
         );
         _logRideReq(
           '[MATCH_DEBUG][DRIVER_DECISION] decision=rejected rideId=$rideId '
@@ -11693,10 +12026,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           TripStateMachine.uiStatusFromSnapshot(validatedCommittedRideData);
       _logRideReq(
         '[MATCH_DEBUG][ACCEPT_TX_COMMIT] rideId=$rideId driverId=$_effectiveDriverId '
-        'idempotent=$acceptLockWasIdempotent rtdb_committed=${transactionResult.committed} '
+        'idempotent=$acceptLockWasIdempotent rtdb_committed=true '
         'trip_state=$committedCanonicalForCommit ui_status=$committedStatus',
       );
-      _logRideReq('[OPEN_POOL_REMOVE] rideId=$rideId market_pool=null source=accept_tx');
+      _logRideReq(
+          '[OPEN_POOL_REMOVE] rideId=$rideId market_pool=null source=accept_tx');
       _logRideReq(
         '[DRIVER_ACCEPT_TX] stage=commit rideId=$rideId driverId=$_effectiveDriverId '
         'trip_state=$committedCanonicalForCommit ui_status=$committedStatus',
@@ -11801,6 +12135,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         '[MATCH_DEBUG][ACCEPT_UI_SUCCESS] rideId=$rideId ui_status=$committedStatus '
         'trip_state=$committedCanonicalForCommit',
       );
+      _logRideReq('[NAVIGATION_TRIGGERED] rideId=$rideId target=active_trip');
+      _ensureActiveTripNavigation(
+        rideId: rideId,
+        rideData: validatedCommittedRideData,
+      );
       _logRideReq(
         '[MATCH_DEBUG][POST_ACCEPT_DRIVER_STATE] rideId=$rideId '
         'rideStatus=$_rideStatus currentRideId=$_currentRideId '
@@ -11822,6 +12161,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           ),
         );
         await _listenToActiveRide(rideId);
+        _logRideReq('[ACTIVE_TRIP_LOADED] rideId=$rideId');
         _scheduleActiveRouteRefresh(
           force: true,
           reason: 'driver_accept_local',
@@ -11885,6 +12225,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
       return true;
     } catch (error) {
+      _logRideReq('[DRIVER_ACCEPT_ERROR] error=$error');
+      final errorMessage = _acceptFailureMessageFromException(error);
+      _setApiStatus(
+        'failed',
+        errorMessage: errorMessage,
+      );
       if (_currentRideId != rideId) {
         _driverActiveRideId = null;
       }
@@ -11910,7 +12256,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logRtdb('accept write failed rideId=$rideId error=$error');
       _log('accept ride error rideId=$rideId error=$error');
       _showSnackBarSafely(
-        const SnackBar(content: Text('Unable to accept this ride right now.')),
+        SnackBar(content: Text(errorMessage)),
       );
       return false;
     } finally {
@@ -12390,6 +12736,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final serviceType = _serviceTypeKey(completedRideData['service_type']);
     final isDispatchDelivery = _isDispatchDeliveryService(serviceType);
     final deliveryProofUrl = _dispatchDeliveryProofPhotoUrl(completedRideData);
+    _setApiStatus('loading');
 
     if (isDispatchDelivery && deliveryProofUrl.isEmpty) {
       _showSnackBarSafely(
@@ -12399,6 +12746,39 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           ),
         ),
       );
+      return;
+    }
+
+    final paymentReference = _valueAsText(
+      completedRideData['customer_transaction_reference'],
+    ).isNotEmpty
+        ? _valueAsText(completedRideData['customer_transaction_reference'])
+        : _valueAsText(completedRideData['payment_reference']);
+    final verifyResult = await _backendSimulation.verifyPayment(
+      BackendVerifyPaymentRequest(
+        rideId: currentRideId,
+        reference: paymentReference.isEmpty
+            ? 'local_$currentRideId'
+            : paymentReference,
+        amount: _asDouble(completedRideData['fare']) ?? 0,
+      ),
+    );
+    if (!verifyResult.ok) {
+      _setApiStatus('failed', errorMessage: verifyResult.message);
+      _showSnackBarSafely(SnackBar(content: Text(verifyResult.message)));
+      return;
+    }
+
+    final completeResult = await _backendSimulation.completeTrip(
+      BackendCompleteTripRequest(
+        rideId: currentRideId,
+        rideSnapshot: completedRideData,
+        serviceType: serviceType,
+      ),
+    );
+    if (!completeResult.ok) {
+      _setApiStatus('failed', errorMessage: completeResult.message);
+      _showSnackBarSafely(SnackBar(content: Text(completeResult.message)));
       return;
     }
 
@@ -12521,10 +12901,54 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _log('trip settlement hook failed rideId=$currentRideId error=$error');
     }
 
+    if (isDispatchDelivery &&
+        !_localWalletCreditedRideIds.contains(currentRideId)) {
+      try {
+        final distanceKm = _asDouble(completedRideData['distance_km']) ??
+            _asDouble(completedRideData['distanceKm']) ??
+            1.0;
+        final baseFare = _asDouble(completedRideData['base_fare']) ??
+            _asDouble(
+                _dispatchDetailsFromRide(completedRideData)['base_fare']) ??
+            0.0;
+        final pricePerKm = _asDouble(completedRideData['price_per_km']) ??
+            _asDouble(
+                _dispatchDetailsFromRide(completedRideData)['price_per_km']) ??
+            0.0;
+        final breakdown = buildDispatchPaymentBreakdown(
+          baseFare: baseFare,
+          distanceKm: distanceKm,
+          pricePerKm: pricePerKm,
+        );
+        final creditResult = await _backendSimulation.creditWallet(
+          BackendCreditWalletRequest(
+            rideId: currentRideId,
+            walletId: _effectiveDriverId,
+            amount: breakdown.riderEarning,
+            transactionType: 'dispatch_earning',
+          ),
+        );
+        if (creditResult.ok) {
+          _localWalletCreditedRideIds.add(currentRideId);
+          _logRideReq(
+            '[WALLET_CREDITED] rideId=$currentRideId amount=${breakdown.riderEarning}',
+          );
+        } else {
+          _logRideReq(
+            '[WALLET_CREDIT_FAILED] rideId=$currentRideId reason=${creditResult.errorCode}',
+          );
+        }
+      } catch (error) {
+        _logRideReq(
+            '[WALLET_CREDIT_FAILED] rideId=$currentRideId error=$error');
+      }
+    }
+
     _log('trip completed rideId=$currentRideId');
     _logRtdb('active ride cleared reason=completed');
     _logTripPanelHidden('completed');
     await _resetTripState();
+    _setApiStatus('success');
     if (mounted && riderId.isNotEmpty) {
       Future<void>.microtask(
         () => _showPostTripReviewSheet(
@@ -13046,7 +13470,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         },
       });
     } catch (error) {
-      _logSafety('rider_safety_alert publish failed rideId=$rideId error=$error');
+      _logSafety(
+          'rider_safety_alert publish failed rideId=$rideId error=$error');
     }
   }
 
@@ -13589,6 +14014,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         Future<void> writeAttempt() async {
           await messageNode.set(payload).timeout(_kRideChatSendTimeout);
         }
+
         try {
           await writeAttempt();
         } catch (_) {
@@ -16114,6 +16540,50 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     );
   }
 
+  Widget _buildDebugOverlay() {
+    final serviceTypes = _effectiveDriverServiceTypes().join(', ');
+    return GestureDetector(
+      onDoubleTap: () {
+        if (!mounted) {
+          return;
+        }
+        _setStateSafely(() {
+          _showDriverDebugOverlay = !_showDriverDebugOverlay;
+        });
+      },
+      child: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.72),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: DefaultTextStyle(
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            height: 1.25,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Text('state: ${_debugTripStateLabel()}'),
+              Text('api: $_lastApiCallStatus'),
+              Text('socket: $_socketStatus'),
+              Text('service: $serviceTypes'),
+              Text(
+                'error: ${_lastActionError.isEmpty ? 'none' : _lastActionError}',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_hasAuthenticatedDriver) {
@@ -16126,6 +16596,15 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       appBar: AppBar(
         title: const Text('NexRide Driver'),
         actions: <Widget>[
+          IconButton(
+            tooltip: 'Debug overlay',
+            onPressed: () {
+              _setStateSafely(() {
+                _showDriverDebugOverlay = !_showDriverDebugOverlay;
+              });
+            },
+            icon: const Icon(Icons.bug_report_outlined),
+          ),
           IconButton(
             tooltip: 'Driver Hub',
             onPressed: () {
@@ -16238,6 +16717,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             ),
           if (_mapInitializationInProgress || _mapInitializationError != null)
             _buildMapInitializationOverlay(),
+          if (_showDriverDebugOverlay)
+            Positioned(
+              top: 98,
+              left: 12,
+              right: 12,
+              child: _buildDebugOverlay(),
+            ),
           if (_hasRenderableActiveRide)
             Positioned(
               bottom: 100,

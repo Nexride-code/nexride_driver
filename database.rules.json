@@ -1,0 +1,52 @@
+{
+  "rules": {
+    "ride_requests": {
+      "$rideId": {
+        ".read": "auth != null",
+        ".write": "auth != null && !data.exists() && newData.exists() && newData.child('rider_id').val() === auth.uid",
+        "driver_id": {
+          ".write": false
+        },
+        "status": {
+          ".write": false
+        },
+        "trip_state": {
+          ".write": false
+        },
+        "accepted_at": {
+          ".write": false
+        },
+        "payment_status": {
+          ".write": false
+        },
+        "payment_verified": {
+          ".write": false
+        },
+        "payment_verified_at": {
+          ".write": false
+        },
+        "wallet_credit_status": {
+          ".write": false
+        }
+      }
+    },
+    "wallets": {
+      "$userId": {
+        ".read": "auth != null && auth.uid === $userId",
+        ".write": false
+      }
+    },
+    "payment_transactions": {
+      "$reference": {
+        ".read": "auth != null",
+        ".write": false
+      }
+    },
+    "driver_earnings": {
+      "$driverId": {
+        ".read": "auth != null && auth.uid === $driverId",
+        ".write": false
+      }
+    }
+  }
+}
