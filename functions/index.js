@@ -168,22 +168,35 @@ const ACCEPT_FROM_OPEN_POOL_STATUSES = new Set([
   "matching",
   "offered",
   "offer_pending",
+  // Rider lifecycle labels observed while rider_id is assigned but driver slot is empty.
+  "assigned",
+  "driver_assigned",
+  "matched",
+  "driver_found",
+  "driver_matched",
+  "driver_found_pending",
 ]);
 
 const RESERVED_FOR_DRIVER_STATUSES = new Set([
   "pending_driver_acceptance",
   "pending_driver_action",
+  "driver_reviewing_request",
 ]);
+
+function normUid(uid) {
+  return String(uid ?? "").trim();
+}
 
 exports.acceptRide = functions.https.onCall(async (data, context) => {
   const rideId = String(data?.rideId ?? "").trim();
-  const driverId = String(data?.driverId ?? "").trim();
+  const driverId = normUid(data?.driverId);
+  const authUid = normUid(context.auth?.uid);
 
   if (!rideId || !driverId) {
     return { success: false, reason: "invalid_input" };
   }
 
-  if (!context.auth || context.auth.uid !== driverId) {
+  if (!context.auth || authUid !== driverId) {
     return { success: false, reason: "unauthorized" };
   }
 
@@ -219,11 +232,10 @@ exports.acceptRide = functions.https.onCall(async (data, context) => {
     const status = String(current.status ?? "").trim().toLowerCase();
     const rawDriverId = current.driver_id;
     const rawAcceptedDriverId = current.accepted_driver_id;
-    const assignedDriverId = String(rawDriverId ?? "").trim();
-    const acceptedDriverId = String(rawAcceptedDriverId ?? "").trim();
+    const assignedDriverId = normUid(rawDriverId);
+    const acceptedDriverId = normUid(rawAcceptedDriverId);
     const expiresAtRaw = current.request_expires_at ?? current.expires_at ?? 0;
     const expiresAt = Number(expiresAtRaw) || 0;
-    const authUid = context.auth.uid;
 
     const assignmentExpiresRaw =
       current.assignment_expires_at ?? current.driver_response_timeout_at ?? 0;
@@ -257,6 +269,7 @@ exports.acceptRide = functions.https.onCall(async (data, context) => {
     }
 
     const reservedForThisDriver =
+      assignedDriverId.length > 0 &&
       assignedDriverId === authUid &&
       RESERVED_FOR_DRIVER_STATUSES.has(status);
     if (reservedForThisDriver) {
@@ -278,8 +291,9 @@ exports.acceptRide = functions.https.onCall(async (data, context) => {
         ...current,
         driver_id: driverId,
         accepted_driver_id: driverId,
+        matched_driver_id: driverId,
         status: "accepted",
-        trip_state: "accepted",
+        trip_state: "driver_accepted",
         accepted_at: now,
         updated_at: now,
       };
@@ -310,8 +324,9 @@ exports.acceptRide = functions.https.onCall(async (data, context) => {
       ...current,
       driver_id: driverId,
       accepted_driver_id: driverId,
+      matched_driver_id: driverId,
       status: "accepted",
-      trip_state: "accepted",
+      trip_state: "driver_accepted",
       accepted_at: now,
       updated_at: now,
     };
