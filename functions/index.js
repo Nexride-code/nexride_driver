@@ -1,10 +1,11 @@
 require("./params");
-const { onCall } = require("firebase-functions/v2/https");
+const { onCall, onRequest } = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
+const { verifyTransactionByReference } = require("./flutterwave_api");
 const {
   flutterwaveSecretKey,
+  flutterwaveWebhookSecret,
   REGION,
-  flutterwaveSecretForVerify,
   platformFeeNgn,
 } = require("./params");
 
@@ -33,69 +34,25 @@ async function verifyPaymentInternal(reference) {
   }
 
   const now = Date.now();
-  const secret = flutterwaveSecretForVerify();
-  if (!secret) {
-    await txRef.update({
-      verified: false,
-      provider_status: "config_missing",
-      verification_error: "flutterwave_secret_missing",
-      verified_at: now,
-      updated_at: now,
-    });
-    return { success: false, reason: "flutterwave_secret_missing" };
-  }
-
-  let response;
-  try {
-    response = await fetch(
-      `https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref=${encodeURIComponent(reference)}`,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${secret}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-  } catch (error) {
-    await txRef.update({
-      verified: false,
-      provider_status: "network_error",
-      verification_error: String(error),
-      verified_at: now,
-      updated_at: now,
-    });
-    return { success: false, reason: "network_error" };
-  }
-
-  let payload = {};
-  try {
-    payload = await response.json();
-  } catch (_) {
-    payload = {};
-  }
-  const providerStatus = String(payload?.status || "").toLowerCase();
-  const dataStatus = String(payload?.data?.status || "").toLowerCase();
-  const amount = Number(payload?.data?.amount || 0);
-  const verified = response.ok && providerStatus === "success" && dataStatus === "successful";
-
+  const v = await verifyTransactionByReference(reference);
   await txRef.update({
-    verified,
-    provider_status: dataStatus || providerStatus || "unknown",
-    amount,
-    provider_payload: payload,
+    verified: v.ok,
+    provider_status: v.providerStatus || "unknown",
+    amount: v.amount ?? 0,
+    provider_payload: v.payload || {},
+    verification_error: v.ok ? null : v.reason || "failed",
     verified_at: now,
     updated_at: now,
   });
 
-  if (!verified) {
-    return { success: false, reason: "verification_failed" };
+  if (!v.ok) {
+    return { success: false, reason: v.reason || "verification_failed" };
   }
   return {
     success: true,
     reason: "verified",
-    amount,
-    providerStatus: dataStatus,
+    amount: v.amount,
+    providerStatus: v.providerStatus,
   };
 }
 
@@ -160,6 +117,7 @@ async function createWalletTransactionInternal({
 }
 
 const ride = require("./ride_callables");
+const paymentFlow = require("./payment_flow");
 
 const rideCallOpts = { region: REGION };
 
@@ -167,12 +125,12 @@ exports.createRideRequest = onCall(rideCallOpts, async (request) =>
   ride.createRideRequest(request.data, callableContext(request), db),
 );
 
-exports.acceptRideRequest = onCall(rideCallOpts, async (request) =>
+exports.acceptRide = onCall(rideCallOpts, async (request) =>
   ride.acceptRideRequest(request.data, callableContext(request), db),
 );
 
-/** @deprecated Use acceptRideRequest — kept for older client builds */
-exports.acceptRide = exports.acceptRideRequest;
+/** @deprecated Prefer acceptRide — kept for older client builds */
+exports.acceptRideRequest = exports.acceptRide;
 
 exports.driverEnroute = onCall(rideCallOpts, async (request) =>
   ride.driverEnroute(request.data, callableContext(request), db),
@@ -190,9 +148,12 @@ exports.completeTrip = onCall(rideCallOpts, async (request) =>
   ride.completeTrip(request.data, callableContext(request), db),
 );
 
-exports.cancelRideRequest = onCall(rideCallOpts, async (request) =>
+exports.cancelRide = onCall(rideCallOpts, async (request) =>
   ride.cancelRideRequest(request.data, callableContext(request), db),
 );
+
+/** @deprecated Prefer cancelRide */
+exports.cancelRideRequest = exports.cancelRide;
 
 exports.expireRideRequest = onCall(rideCallOpts, async (request) =>
   ride.expireRideRequest(request.data, callableContext(request), db),
@@ -214,6 +175,36 @@ exports.verifyPayment = onCall(
     }
     return verifyPaymentInternal(reference);
   },
+);
+
+exports.initiateFlutterwavePayment = onCall(
+  { region: REGION, secrets: [flutterwaveSecretKey] },
+  async (request) =>
+    paymentFlow.initiateFlutterwavePayment(
+      request.data,
+      callableContext(request),
+      db,
+    ),
+);
+
+exports.verifyFlutterwavePayment = onCall(
+  { region: REGION, secrets: [flutterwaveSecretKey] },
+  async (request) =>
+    paymentFlow.verifyFlutterwavePayment(
+      request.data,
+      callableContext(request),
+      db,
+    ),
+);
+
+exports.flutterwaveWebhook = onRequest(
+  {
+    region: REGION,
+    secrets: [flutterwaveWebhookSecret],
+    cors: true,
+    invoker: "public",
+  },
+  async (req, res) => paymentFlow.handleFlutterwaveWebhook(req, res, db),
 );
 
 exports.createWalletTransaction = onCall(rideCallOpts, async (request) => {

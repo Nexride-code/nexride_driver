@@ -10,6 +10,8 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 const { defineSecret, defineString } = require("firebase-functions/params");
 
 const flutterwaveSecretKey = defineSecret("FLUTTERWAVE_SECRET_KEY");
+/** Must match Flutterwave dashboard webhook secret (`verif-hash` header). */
+const flutterwaveWebhookSecret = defineSecret("FLUTTERWAVE_WEBHOOK_SECRET");
 
 const nexridePlatformFeeNgn = defineString("NEXRIDE_PLATFORM_FEE_NGN", {
   default: "350",
@@ -29,6 +31,7 @@ function platformFeeNgn() {
 
 module.exports = {
   flutterwaveSecretKey,
+  flutterwaveWebhookSecret,
   nexridePlatformFeeNgn,
   REGION,
   flutterwaveSecretForVerify,

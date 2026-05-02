@@ -8,6 +8,8 @@ const { platformFeeNgn } = require("./params");
 
 const TRIP_STATE = {
   searching: "searching",
+  /** Post-accept canonical (production backend-controlled match). */
+  accepted: "accepted",
   driver_assigned: "driver_assigned",
   driver_arriving: "driver_arriving",
   arrived: "arrived",
@@ -86,10 +88,142 @@ function isOpenPoolRide(ride) {
   return false;
 }
 
+function paymentAllowsDispatch(ride) {
+  if (!ride || typeof ride !== "object") {
+    return false;
+  }
+  const pm = String(ride.payment_method ?? ride.paymentMethod ?? "cash")
+    .trim()
+    .toLowerCase();
+  const ps = String(ride.payment_status ?? ride.paymentStatus ?? "")
+    .trim()
+    .toLowerCase();
+  if (pm === "cash" || pm === "bank_transfer") {
+    return true;
+  }
+  return ps === "verified";
+}
+
+const ACCEPTABLE_OPEN_STATUS = new Set([
+  "searching",
+  "requesting",
+  "pending_driver_acceptance",
+]);
+
+async function clearFanoutAndOffers(db, rideId) {
+  const rid = normUid(rideId);
+  if (!rid) return;
+  const snap = await db.ref(`ride_offer_fanout/${rid}`).get();
+  const val = snap.val();
+  if (!val || typeof val !== "object") {
+    return;
+  }
+  const updates = {};
+  for (const driverId of Object.keys(val)) {
+    const d = normUid(driverId);
+    if (!d) continue;
+    updates[`driver_offer_queue/${d}/${rid}`] = null;
+    updates[`ride_offer_fanout/${rid}/${d}`] = null;
+  }
+  if (Object.keys(updates).length) {
+    await db.ref().update(updates);
+  }
+}
+
+async function fanOutDriverOffersIfEligible(db, rideId, ridePayload) {
+  const rid = normUid(rideId);
+  const market = String(ridePayload.market_pool ?? ridePayload.market ?? "").trim();
+  if (!rid || !market) {
+    return;
+  }
+  if (!paymentAllowsDispatch(ridePayload)) {
+    return;
+  }
+  const driversSnap = await db.ref("drivers").orderByChild("dispatch_market").equalTo(market).once("value");
+  const raw = driversSnap.val() || {};
+  const now = nowMs();
+  const updates = {};
+  const pickup = ridePayload.pickup && typeof ridePayload.pickup === "object" ? ridePayload.pickup : {};
+  const dropoff =
+    ridePayload.dropoff && typeof ridePayload.dropoff === "object" ? ridePayload.dropoff : null;
+  for (const [driverId, profile] of Object.entries(raw)) {
+    if (!profile || typeof profile !== "object") {
+      continue;
+    }
+    const online =
+      profile.isOnline === true ||
+      profile.is_online === true ||
+      profile.online === true;
+    if (!online) {
+      continue;
+    }
+    const d = normUid(driverId);
+    if (!d) {
+      continue;
+    }
+    updates[`ride_offer_fanout/${rid}/${d}`] = true;
+    updates[`driver_offer_queue/${d}/${rid}`] = {
+      ride_id: rid,
+      status: "open",
+      market,
+      fare: Number(ridePayload.fare ?? 0) || 0,
+      currency: String(ridePayload.currency ?? "NGN").trim().toUpperCase() || "NGN",
+      service_type: String(ridePayload.service_type ?? "ride").trim(),
+      payment_method: String(ridePayload.payment_method ?? "").trim().toLowerCase(),
+      payment_status: String(ridePayload.payment_status ?? "").trim().toLowerCase(),
+      pickup,
+      dropoff,
+      expires_at: Number(ridePayload.expires_at ?? 0) || 0,
+      created_at: now,
+      trip_state: TRIP_STATE.searching,
+      request_status: "searching",
+    };
+  }
+  if (Object.keys(updates).length) {
+    await db.ref().update(updates);
+  }
+}
+
+async function setActiveTripPointers(db, rideId, riderId, driverId, rideSummary) {
+  const rid = normUid(rideId);
+  const r = normUid(riderId);
+  const d = normUid(driverId);
+  if (!rid || !r || !d) {
+    return;
+  }
+  const now = nowMs();
+  await db.ref().update({
+    [`active_trips/${rid}`]: {
+      ride_id: rid,
+      rider_id: r,
+      driver_id: d,
+      status: "active",
+      updated_at: now,
+      trip_state: rideSummary?.trip_state ?? TRIP_STATE.accepted,
+    },
+    [`rider_active_ride/${r}`]: { ride_id: rid, updated_at: now },
+    [`driver_active_ride/${d}`]: { ride_id: rid, updated_at: now },
+  });
+}
+
+async function clearActiveTripPointers(db, rideId, riderId, driverId) {
+  const rid = normUid(rideId);
+  const r = normUid(riderId);
+  const d = normUid(driverId);
+  const u = {};
+  if (rid) u[`active_trips/${rid}`] = null;
+  if (r) u[`rider_active_ride/${r}`] = null;
+  if (d) u[`driver_active_ride/${d}`] = null;
+  if (Object.keys(u).length) {
+    await db.ref().update(u);
+  }
+}
+
 function legacyUiStatusForTripState(tripState) {
   switch (tripState) {
     case TRIP_STATE.searching:
       return "searching";
+    case TRIP_STATE.accepted:
     case TRIP_STATE.driver_assigned:
       return "accepted";
     case TRIP_STATE.driver_arriving:
@@ -133,10 +267,6 @@ async function createRideRequest(data, context, db) {
     return { success: false, reason: "unauthorized" };
   }
   const riderId = normUid(context.auth.uid);
-  const rideId = normUid(data?.ride_id ?? data?.rideId);
-  if (!rideId) {
-    return { success: false, reason: "invalid_ride_id" };
-  }
   const bodyRider = normUid(data?.rider_id ?? data?.riderId);
   if (bodyRider && bodyRider !== riderId) {
     return { success: false, reason: "rider_mismatch" };
@@ -155,15 +285,15 @@ async function createRideRequest(data, context, db) {
   }
 
   const fare = Number(data?.fare ?? 0);
+  if (!Number.isFinite(fare) || fare <= 0) {
+    return { success: false, reason: "invalid_fare" };
+  }
   const currency = String(data?.currency ?? "NGN").trim().toUpperCase() || "NGN";
   const paymentMethod = String(data?.payment_method ?? data?.paymentMethod ?? "cash")
     .trim()
     .toLowerCase();
-  const paymentStatus = String(
-    data?.payment_status ?? data?.paymentStatus ?? "pending",
-  )
-    .trim()
-    .toLowerCase();
+  const cashLike = paymentMethod === "cash" || paymentMethod === "bank_transfer";
+  const paymentStatus = cashLike ? "verified" : "pending";
 
   const distanceKm = Number(data?.distance_km ?? data?.distanceKm ?? 0) || 0;
   const etaMin = Number(data?.eta_min ?? data?.etaMin ?? 0) || 0;
@@ -171,10 +301,10 @@ async function createRideRequest(data, context, db) {
     Number(data?.expires_at ?? data?.expiresAt ?? 0) ||
     nowMs() + 15 * 60 * 1000;
 
-  const rideRef = db.ref(`ride_requests/${rideId}`);
-  const snap = await rideRef.get();
-  if (snap.exists()) {
-    return { success: false, reason: "ride_id_already_exists" };
+  const rideRef = db.ref("ride_requests").push();
+  const rideId = normUid(rideRef.key);
+  if (!rideId) {
+    return { success: false, reason: "ride_id_alloc_failed" };
   }
 
   const ts = nowMs();
@@ -260,6 +390,12 @@ async function createRideRequest(data, context, db) {
   }
 
   await rideRef.set(payload);
+  await db.ref(`rider_active_ride/${riderId}`).set({
+    ride_id: rideId,
+    phase: "searching",
+    updated_at: ts,
+  });
+  await fanOutDriverOffersIfEligible(db, rideId, payload);
   await writeAudit(db, {
     type: "ride_create",
     ride_id: rideId,
@@ -272,8 +408,8 @@ async function createRideRequest(data, context, db) {
 
 async function acceptRideRequest(data, context, db) {
   const rideId = normUid(data?.rideId ?? data?.ride_id);
-  const driverId = normUid(data?.driverId ?? data?.driver_id);
   const authUid = normUid(context.auth?.uid);
+  const driverId = normUid(data?.driverId ?? data?.driver_id) || authUid;
 
   if (!rideId || !driverId) {
     return { success: false, reason: "invalid_input" };
@@ -282,15 +418,47 @@ async function acceptRideRequest(data, context, db) {
     return { success: false, reason: "unauthorized" };
   }
 
-  const ridePath = `ride_requests/${rideId}`;
-  const rideRef = db.ref(ridePath);
+  const rideRef = db.ref(`ride_requests/${rideId}`);
+  const preSnap = await rideRef.get();
+  const pre = preSnap.val();
+  const preTrip = String(pre?.trip_state ?? "").trim().toLowerCase();
+  const preStatus = String(pre?.status ?? "").trim().toLowerCase();
+  const alreadyMine =
+    pre &&
+    typeof pre === "object" &&
+    normUid(pre.driver_id) === driverId &&
+    (preTrip === TRIP_STATE.accepted ||
+      preTrip === TRIP_STATE.driver_assigned ||
+      preTrip === "driver_accepted" ||
+      preStatus === "accepted");
+  if (alreadyMine) {
+    return { success: true, idempotent: true, reason: "already_accepted" };
+  }
+
+  const offerSnap = await db.ref(`driver_offer_queue/${driverId}/${rideId}`).get();
+  if (!offerSnap.exists()) {
+    return { success: false, reason: "no_offer" };
+  }
+  const offer = offerSnap.val();
+  if (offer && String(offer.status ?? "").trim().toLowerCase() === "withdrawn") {
+    return { success: false, reason: "offer_withdrawn" };
+  }
+
+  if (!paymentAllowsDispatch(pre || {})) {
+    return { success: false, reason: "payment_not_verified" };
+  }
+
   const now = nowMs();
   let failureReason = "unknown";
-  let idempotent = false;
 
   const tx = await rideRef.transaction((current) => {
     if (!current || typeof current !== "object") {
       failureReason = "ride_missing";
+      return;
+    }
+
+    if (!paymentAllowsDispatch(current)) {
+      failureReason = "payment_not_verified";
       return;
     }
 
@@ -300,21 +468,23 @@ async function acceptRideRequest(data, context, db) {
     const assigned = normUid(rawDriverId);
 
     const already =
-      assigned === authUid &&
-      (tripState === TRIP_STATE.driver_assigned ||
+      assigned === driverId &&
+      (tripState === TRIP_STATE.accepted ||
+        tripState === TRIP_STATE.driver_assigned ||
         tripState === "driver_accepted" ||
         status === "accepted");
     if (already) {
-      idempotent = true;
       return current;
     }
 
-    if (!isPlaceholderDriverId(rawDriverId)) {
+    if (!isPlaceholderDriverId(rawDriverId) && assigned !== driverId) {
       failureReason = "driver_already_set";
       return;
     }
 
-    if (!isOpenPoolRide(current)) {
+    const openByTrip = isOpenPoolRide(current);
+    const openByStatus = ACCEPTABLE_OPEN_STATUS.has(status);
+    if (!openByTrip && !openByStatus) {
       failureReason = "status_not_open";
       return;
     }
@@ -331,19 +501,23 @@ async function acceptRideRequest(data, context, db) {
       matched_driver_id: driverId,
       accepted_driver_id: driverId,
       status: "accepted",
-      trip_state: TRIP_STATE.driver_assigned,
-      market_pool: null,
+      trip_state: TRIP_STATE.accepted,
       accepted_at: now,
       updated_at: now,
     };
   });
 
-  if (!tx.committed && !idempotent) {
+  if (!tx.committed) {
     return {
       success: false,
       reason: failureReason === "unknown" ? "not_available" : failureReason,
     };
   }
+
+  const finalRide = tx.snapshot.val();
+  const riderId = normUid(finalRide?.rider_id);
+  await clearFanoutAndOffers(db, rideId);
+  await setActiveTripPointers(db, rideId, riderId, driverId, finalRide);
 
   await writeAudit(db, {
     type: "ride_accept",
@@ -354,8 +528,8 @@ async function acceptRideRequest(data, context, db) {
 
   return {
     success: true,
-    idempotent,
-    reason: idempotent ? "already_accepted" : "accepted",
+    idempotent: false,
+    reason: "accepted",
   };
 }
 
@@ -380,7 +554,11 @@ async function driverEnroute(data, context, db) {
     if (ts === TRIP_STATE.driver_arriving) {
       return cur;
     }
-    if (ts !== TRIP_STATE.driver_assigned && ts !== "driver_accepted") {
+    if (
+      ts !== TRIP_STATE.driver_assigned &&
+      ts !== TRIP_STATE.accepted &&
+      ts !== "driver_accepted"
+    ) {
       reason = "invalid_state";
       return;
     }
@@ -545,6 +723,10 @@ async function completeTrip(data, context, db) {
   }
   const ride = tx.snapshot.val();
   const riderId = normUid(ride?.rider_id);
+  await clearActiveTripPointers(db, rideId, riderId, driverId);
+  if (riderId) {
+    await db.ref(`rider_active_ride/${riderId}`).remove();
+  }
   const hookRef = db.ref(`trip_settlement_hooks/${rideId}`);
   await hookRef.update({
     rideId,
@@ -608,6 +790,16 @@ async function cancelRideRequest(data, context, db) {
   if (!tx.committed) {
     return { success: false, reason };
   }
+  const v = tx.snapshot.val();
+  const rider = normUid(v?.rider_id);
+  const drv = normUid(v?.driver_id);
+  await clearFanoutAndOffers(db, rideId);
+  if (drv && !isPlaceholderDriverId(v?.driver_id)) {
+    await clearActiveTripPointers(db, rideId, rider, drv);
+  }
+  if (rider) {
+    await db.ref(`rider_active_ride/${rider}`).remove();
+  }
   await writeAudit(db, {
     type: "ride_cancel",
     ride_id: rideId,
@@ -656,6 +848,10 @@ async function expireRideRequest(data, context, db) {
   });
   if (!tx.committed) {
     return { success: false, reason };
+  }
+  await clearFanoutAndOffers(db, rideId);
+  if (uid) {
+    await db.ref(`rider_active_ride/${uid}`).remove();
   }
   await writeAudit(db, { type: "ride_expire", ride_id: rideId, actor_uid: uid });
   return { success: true, reason: "expired" };
@@ -740,6 +936,7 @@ module.exports = {
   TRIP_STATE,
   createRideRequest,
   acceptRideRequest,
+  fanOutDriverOffersIfEligible,
   driverEnroute,
   driverArrived,
   startTrip,
