@@ -287,6 +287,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   /// unavailable UI must not fight the active-trip flow for this [rideId] until trip end.
   final Set<String> _terminalSelfAcceptedRideIds = <String>{};
 
+  /// Dedupes redundant [driver_offer_queue] value events while an offer fingerprint is unchanged.
+  final Map<String, String> _lastDiscoveryDismissFingerprintByRideId =
+      <String, String>{};
+  final Map<String, int> _discoveryPopupCooldownUntilMs = <String, int>{};
+
   /// Prevents concurrent [showRideRequestPopup] opens from parallel RTDB snapshots.
   bool _ridePopupOpenPipelineLocked = false;
   int _lastActiveHeartbeatLogCount = 0;
@@ -313,6 +318,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   /// Synthetic ride snapshots built from [driver_offer_queue] entries (preflight accept).
   final Map<String, Map<String, dynamic>> _driverOfferRideCache =
       <String, Map<String, dynamic>>{};
+  final Set<String> _loggedDriverOfferReceivedRideIds = <String>{};
   int _rideRequestListenerToken = 0;
 
   /// Serializes discovery attach/cancel so two callers cannot overlap native query setup.
@@ -2785,6 +2791,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _handledRideIds.clear();
     _suppressedRidePopupIds.clear();
     _terminalSelfAcceptedRideIds.clear();
+    _lastDiscoveryDismissFingerprintByRideId.clear();
+    _discoveryPopupCooldownUntilMs.clear();
+    _loggedDriverOfferReceivedRideIds.clear();
     _rideRequestPopupQueue.clear();
     _onlineSessionStartedAt = 0;
     _lastAvailabilityIntentOnline = false;
@@ -6170,6 +6179,21 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     return n.isNotEmpty && _terminalSelfAcceptedRideIds.contains(n);
   }
 
+  String _discoveryOfferFingerprint(
+    String rideId,
+    Map<String, dynamic> rideData,
+  ) {
+    return <String>[
+      rideId,
+      _valueAsText(rideData[RtdbRideRequestFields.createdAt]),
+      '${_asDouble(rideData[RtdbRideRequestFields.fare]) ?? 0}',
+      '${_rideExpiryTimestamp(rideData)}',
+      _valueAsText(rideData[RtdbRideRequestFields.paymentStatus]),
+      _valueAsText(rideData[RtdbRideRequestFields.status]),
+      _valueAsText(rideData[RtdbRideRequestFields.tripState]),
+    ].join('\x1f');
+  }
+
   String? _popupLocalSkipReason(String rideId) {
     final normalizedId = rideId.trim();
     if (_handledRideIds.contains(normalizedId)) {
@@ -6203,6 +6227,17 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     if (_acceptingPopupRideId == normalizedId) {
       return 'accept_in_flight';
+    }
+
+    final cachedOffer = _driverOfferRideCache[normalizedId];
+    if (cachedOffer != null) {
+      final fp = _discoveryOfferFingerprint(normalizedId, cachedOffer);
+      final until = _discoveryPopupCooldownUntilMs[normalizedId] ?? 0;
+      final lastFp = _lastDiscoveryDismissFingerprintByRideId[normalizedId];
+      final nowClock = DateTime.now().millisecondsSinceEpoch;
+      if (until > nowClock && lastFp != null && lastFp == fp) {
+        return 'duplicate_offer_snapshot';
+      }
     }
 
     if (_presentedRideIds.contains(normalizedId)) {
@@ -6799,6 +6834,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
     return switch (blockedReason) {
       'driver_already_set' => 'Ride already taken',
+      'already_taken' => 'Ride already taken',
       'assignment_expired' ||
       'expired' ||
       'driver_response_timeout' =>
@@ -6814,6 +6850,42 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       'invalid_input' => 'Invalid state',
       _ => 'This request is no longer available.',
     };
+  }
+
+  void _suppressPopupForeverAfterTerminalAcceptFailure(
+    String rideId,
+    String reason,
+  ) {
+    final normalized = reason.trim().toLowerCase();
+    const terminal = <String>{
+      'already_taken',
+      'driver_already_set',
+      'expired',
+      'offer_withdrawn',
+      'no_offer',
+      'status_not_open',
+      'payment_not_verified',
+      'ride_missing',
+      'driver_not_eligible',
+      'driver_profile_missing',
+      'not_available',
+      'offer_market_mismatch',
+      'offer_ride_mismatch',
+    };
+    if (!terminal.contains(normalized)) {
+      return;
+    }
+    final id = rideId.trim();
+    if (id.isEmpty) {
+      return;
+    }
+    _foreverSuppressedRidePopupIds.add(id);
+    _suppressedRidePopupIds.add(id);
+    _handledRideIds.add(id);
+    _presentedRideIds.remove(id);
+    _logRideReq(
+      '[POPUP_SUPPRESS_TERMINAL_ACCEPT] rideId=$id reason=$normalized',
+    );
   }
 
   String _acceptFailureMessageFromException(Object error) {
@@ -7482,6 +7554,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _declinedRideIds.clear();
     _handledRideIds.clear();
     _suppressedRidePopupIds.clear();
+    _lastDiscoveryDismissFingerprintByRideId.clear();
+    _discoveryPopupCooldownUntilMs.clear();
+    _loggedDriverOfferReceivedRideIds.clear();
     _rideRequestPopupQueue.clear();
     _onlineSessionStartedAt = 0;
 
@@ -8923,6 +8998,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _suppressedRidePopupIds.clear();
     _foreverSuppressedRidePopupIds.clear();
     _terminalSelfAcceptedRideIds.clear();
+    _lastDiscoveryDismissFingerprintByRideId.clear();
+    _discoveryPopupCooldownUntilMs.clear();
+    _loggedDriverOfferReceivedRideIds.clear();
     _rideRequestPopupQueue.clear();
     _cancelPendingRouteRequests(reason: 'go_offline');
     _onlineSessionStartedAt = 0;
@@ -9797,6 +9875,9 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           'ride eval rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason}',
         );
         if (qualifies) {
+          if (_loggedDriverOfferReceivedRideIds.add(rideId)) {
+            debugPrint('DRIVER_OFFER_RECEIVED rideId=$rideId');
+          }
           activeOpenRideMap[rideId] = rideData;
         }
       }
@@ -11451,6 +11532,14 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     } finally {
       _clearRidePopupTimer();
       if (!rideAccepted) {
+        final rid = ride.rideId.trim();
+        final cachedOffer = _driverOfferRideCache[rid];
+        if (cachedOffer != null && rid.isNotEmpty) {
+          _lastDiscoveryDismissFingerprintByRideId[rid] =
+              _discoveryOfferFingerprint(rid, cachedOffer);
+          _discoveryPopupCooldownUntilMs[rid] =
+              DateTime.now().millisecondsSinceEpoch + 4800;
+        }
         _presentedRideIds.remove(ride.rideId.trim());
       }
       if (rideReserved && !rideAccepted) {
@@ -11770,6 +11859,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         if (_rideBelongsToAnotherDriver(latestRideData)) {
           _logRtdb('accept lost rideId=$rideId');
         }
+        _suppressPopupForeverAfterTerminalAcceptFailure(
+          rideId,
+          latestBlockedReason,
+        );
         _showSnackBarSafely(
           SnackBar(
             content: Text(
@@ -11893,6 +11986,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _terminalSelfAcceptedRideIds.add(rid);
       _foreverSuppressedRidePopupIds.add(rid);
       _suppressedRidePopupIds.add(rid);
+      _discoveryPopupCooldownUntilMs.remove(rid);
+      _lastDiscoveryDismissFingerprintByRideId.remove(rid);
       _presentedRideIds.remove(rid);
       _logRideReq(
         '[MATCH_DEBUG][POPUP_SUPPRESSED_ACCEPTED] rideId=$rideId driverId=$_effectiveDriverId '

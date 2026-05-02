@@ -55,12 +55,14 @@ firebase functions:list
 
 You should see:
 
-- **Callable:** `createRideRequest`, `acceptRide`, `cancelRide`, `startTrip`, `completeTrip`, `verifyPayment`, `verifyFlutterwavePayment`, `initiateFlutterwavePayment`, `createWalletTransaction`, `requestWithdrawal`, `approveWithdrawal`, …
+- **Callable:** `createRideRequest`, `acceptRide`, `cancelRide`, `startTrip`, `completeTrip`, `getRideTrackSummary`, `verifyPayment`, `verifyFlutterwavePayment`, `initiateFlutterwavePayment`, `createWalletTransaction`, `requestWithdrawal`, `approveWithdrawal`, `adminListLiveRides`, `supportSearchRide`, …
 - **HTTPS:** `flutterwaveWebhook` (HTTP endpoint, not callable).
 
 If `flutterwaveWebhook` is missing, the deploy likely failed (check logs); ensure **both** secrets exist and redeploy.
 
 ## Hosting (public site + admin/support/track SPA)
+
+Copy `web/.env.example` → `web/.env` and set `VITE_FIREBASE_*` (same project as Functions).
 
 Build the Vite app once:
 
@@ -72,6 +74,25 @@ cd ..
 firebase deploy --only hosting
 ```
 
+### Public tracking
+
+- Share URL: `/track/{trackToken}` where `trackToken` is returned from `createRideRequest` as `trackToken` (opaque; not the internal ride node id unless you intentionally reuse it).
+- Data path: `ride_track_public/{trackToken}` (world-readable only with the secret token).
+- Callable: `getRideTrackSummary` (`invoker: public`) returns the same fields for clients that cannot use RTDB.
+
+### Admin RTDB flag
+
+Set `admins/{firebaseAuthUid} = true` (boolean) for operators without custom claims, or set `auth.token.admin` via Admin SDK. Support desk: `support_staff/{uid} = true` or `auth.token.support_staff`.
+
+### New admin/support callables
+
+- `adminListLiveRides`, `adminGetRideDetails`, `adminListPendingWithdrawals`, `adminListPayments`, `adminListDrivers`, `adminListRiders`, `adminApproveWithdrawal`, `adminRejectWithdrawal`, `adminVerifyDriver`
+- `supportSearchRide`, `supportSearchUser`, `supportListTickets`, `supportUpdateTicket`
+
+### Flutterwave webhook logs (Cloud Logging)
+
+Structured log lines include: `WEBHOOK_RECEIVED`, `WEBHOOK_VERIFIED`, `WEBHOOK_VERIFY_FAILED`, `PAYMENT_APPLIED`, `PAYMENT_DUPLICATE_IGNORED`, `WEBHOOK_REJECTED_BAD_HASH`.
+
 ## GitHub (typical flow)
 
 ```bash
@@ -81,9 +102,9 @@ git commit -m "chore: production payments webhook, withdrawals, web scaffold"
 git push origin HEAD
 ```
 
-## Admin custom claims
+## Admin access (claims and/or RTDB)
 
-`approveWithdrawal`, `createWalletTransaction`, and admin **cancel ride** expect `auth.token.admin === true`. Set via Admin SDK / your user-provisioning flow (not included in this repo).
+`approveWithdrawal`, `createWalletTransaction`, admin callables, and admin **cancel ride** accept either `auth.token.admin === true` **or** `admins/{uid} === true` in Realtime Database (evaluated in Cloud Functions).
 
 ## Test checklist (live)
 
@@ -94,7 +115,9 @@ git push origin HEAD
 5. Rider: pay card flow → `initiateFlutterwavePayment` → after checkout, `verifyPayment` or webhook → `payment_status` `verified` + `payments/{flutterwaveId}` row.
 6. Driver: `completeTrip` allowed only if payment OK (cash/bank_transfer or `payment_status` verified).
 7. Driver: `requestWithdrawal` → admin `approveWithdrawal` with `status: paid` debits wallet once (idempotent key).
-8. Admin/support: use Flutter admin app or TODO web dashboards with proper Auth + claims.
+8. Admin: sign in at `/admin` with `admins/{uid}` or `admin` claim; exercise list + withdrawal actions.
+9. Support: sign in at `/support` with `support_staff/{uid}` or claim; search ride/user and tickets.
+10. Public track: open `/track/{trackToken}`; confirm no phone/email; ETA and areas update from `ride_track_public`.
 
 ## Wallet double-credit
 

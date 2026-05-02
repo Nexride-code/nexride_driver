@@ -24,6 +24,7 @@ const withdrawFlow = require("./withdraw_flow");
 const trackPublic = require("./track_public");
 const adminCallables = require("./admin_callables");
 const supportCallables = require("./support_callables");
+const { getRideCallRtcToken } = require("./ride_call_rtc");
 
 async function verifyPaymentInternal(reference) {
   const ref = String(reference || "").trim();
@@ -185,6 +186,11 @@ exports.patchRideRequestMetadata = onCall(rideCallOpts, async (request) =>
 exports.getRideTrackSummary = onCall(
   { region: REGION, invoker: "public" },
   async (request) => trackPublic.getRideTrackSummary(request.data, db),
+);
+
+/** Agora RTC — server-signed token; requires AGORA_APP_ID + AGORA_APP_CERTIFICATE in env. */
+exports.getRideCallRtcToken = onCall(rideCallOpts, async (request) =>
+  getRideCallRtcToken(request.data, callableContext(request), db),
 );
 
 exports.adminListLiveRides = onCall(rideCallOpts, async (request) =>

@@ -97,7 +97,7 @@ function areaFromLocation(loc, rideHints) {
 function pickupAreaFromRide(ride) {
   const pickup = ride.pickup && typeof ride.pickup === "object" ? ride.pickup : {};
   const hints = {
-    pickup_area: ride.pickup_area,
+    pickup_area: ride.pickup_area ?? ride.pickupArea,
     pickup_zone: ride.pickup_zone,
     area: ride.area,
   };
@@ -108,8 +108,8 @@ function pickupAreaFromRide(ride) {
 function dropoffAreaFromRide(ride) {
   const drop = ride.dropoff && typeof ride.dropoff === "object" ? ride.dropoff : {};
   const hints = {
-    destination_area: ride.destination_area,
-    pickup_area: null,
+    destination_area: ride.destination_area ?? ride.destinationArea,
+    destination_zone: ride.destination_zone,
   };
   const a = areaFromLocation(drop, hints);
   return a || "Drop-off area";

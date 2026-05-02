@@ -3,6 +3,7 @@
  */
 
 const { createWalletTransactionInternal } = require("./wallet_core");
+const { isNexRideAdmin } = require("./admin_auth");
 
 function normUid(uid) {
   return String(uid ?? "").trim();
@@ -10,10 +11,6 @@ function normUid(uid) {
 
 function nowMs() {
   return Date.now();
-}
-
-function isAdminContext(context) {
-  return context?.auth?.token?.admin === true;
 }
 
 async function requestWithdrawal(data, context, db) {
@@ -61,7 +58,7 @@ async function requestWithdrawal(data, context, db) {
 }
 
 async function approveWithdrawal(data, context, db) {
-  if (!context.auth || !isAdminContext(context)) {
+  if (!context.auth || !(await isNexRideAdmin(db, context))) {
     return { success: false, reason: "unauthorized" };
   }
   const withdrawalId = normUid(data?.withdrawalId ?? data?.withdrawal_id);

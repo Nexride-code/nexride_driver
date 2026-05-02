@@ -1,4 +1,5 @@
 import { Link, Navigate, Route, Routes } from "react-router-dom";
+import { COPY } from "./content/siteCopy";
 import { HomePage } from "./pages/HomePage";
 import { StaticPage } from "./pages/StaticPage";
 import { TrackRidePage } from "./pages/TrackRidePage";
@@ -20,9 +21,9 @@ function Layout({ children }: { children: React.ReactNode }) {
           <Link to="/contact">Contact</Link>
           <Link to="/terms">Terms</Link>
           <Link to="/privacy">Privacy</Link>
-          <Link to="/track/sample-ride-id">Track ride</Link>
-          <Link to="/admin">Admin</Link>
           <Link to="/support">Support</Link>
+          <Link to="/track/sample_token">Track ride</Link>
+          <Link to="/admin">Admin</Link>
         </nav>
       </header>
       <main>{children}</main>
@@ -35,15 +36,15 @@ export function App() {
     <Layout>
       <Routes>
         <Route path="/" element={<HomePage />} />
-        <Route path="/about" element={<StaticPage title="About" body="TODO: company story and mission." />} />
-        <Route path="/safety" element={<StaticPage title="Safety" body="TODO: safety commitments and incident process." />} />
-        <Route path="/drivers" element={<StaticPage title="Drivers" body="TODO: onboarding, earnings overview, requirements." />} />
-        <Route path="/riders" element={<StaticPage title="Riders" body="TODO: how to book, payment options, cities." />} />
-        <Route path="/pricing" element={<StaticPage title="Pricing" body="TODO: fare model and example estimates." />} />
-        <Route path="/contact" element={<StaticPage title="Contact" body="TODO: support email, phone, office." />} />
-        <Route path="/terms" element={<StaticPage title="Terms" body="TODO: legal terms of service." />} />
-        <Route path="/privacy" element={<StaticPage title="Privacy" body="TODO: privacy policy." />} />
-        <Route path="/track/:rideId" element={<TrackRidePage />} />
+        <Route path="/about" element={<StaticPage title="About" body={COPY.about} />} />
+        <Route path="/safety" element={<StaticPage title="Safety" body={COPY.safety} />} />
+        <Route path="/drivers" element={<StaticPage title="Drivers" body={COPY.drivers} />} />
+        <Route path="/riders" element={<StaticPage title="Riders" body={COPY.riders} />} />
+        <Route path="/pricing" element={<StaticPage title="Pricing" body={COPY.pricing} />} />
+        <Route path="/contact" element={<StaticPage title="Contact" body={COPY.contact} />} />
+        <Route path="/terms" element={<StaticPage title="Terms" body={COPY.terms} />} />
+        <Route path="/privacy" element={<StaticPage title="Privacy" body={COPY.privacy} />} />
+        <Route path="/track/:token" element={<TrackRidePage />} />
         <Route path="/admin/*" element={<AdminShell />} />
         <Route path="/support/*" element={<SupportShell />} />
         <Route path="*" element={<Navigate to="/" replace />} />
