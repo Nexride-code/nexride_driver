@@ -24,6 +24,7 @@ import '../services/call_service.dart';
 import '../services/dispatch_photo_upload_service.dart';
 import '../services/driver_alert_sound_service.dart';
 import '../services/local_backend_simulation_service.dart';
+import '../services/ride_cloud_functions_service.dart';
 import '../services/road_route_service.dart';
 import '../services/driver_trip_safety_service.dart';
 import '../services/rider_accountability_service.dart';
@@ -81,7 +82,6 @@ const int _kRidePopupCountdownSeconds = 30;
 // Temporary debug switch: keep market matching strict, but bypass distance
 // radius suppression so all active rides in the same market are visible.
 const bool _kDebugAllowAllActiveMarketRides = true;
-const String _kPendingDriverAcceptanceStatus = 'pending_driver_acceptance';
 const double _kRouteRefreshDistanceMeters = 35;
 const double _kArrivedDistanceThresholdMeters = 100;
 const double _kWaypointReachedThresholdMeters = 80;
@@ -98,6 +98,8 @@ const double _kSuddenStopMaxDtSec = 8;
 const Duration _kDriverMapInitializationTimeout = Duration(seconds: 12);
 const Duration _kRideChatSendTimeout = Duration(seconds: 8);
 const Set<String> _kRenderableRideStatuses = <String>{
+  // Reserved-offer popup (driver matched — waiting for ACCEPT tap).
+  'pending_driver_action',
   'accepted',
   'arriving',
   'arrived',
@@ -267,6 +269,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       DriverTripSafetyService();
   final FirebaseFunctions _functions =
       FirebaseFunctions.instanceFor(region: 'us-central1');
+  late final RideCloudFunctionsService _rideCloud =
+      RideCloudFunctionsService(functions: _functions);
   final RoadRouteService _roadRouteService = RoadRouteService();
   final Set<String> _presentedRideIds = <String>{};
   final Set<String> _timedOutRideIds = <String>{};
@@ -287,6 +291,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   bool _ridePopupOpenPipelineLocked = false;
   int _lastActiveHeartbeatLogCount = 0;
   bool _isDriverCancellingRide = false;
+  /// Prevents repeated [driverEnroute] HTTPS calls for the same active ride.
+  String? _driverEnrouteCloudSentRideId;
   final Set<String> _loggedDriverChatMessageIds = <String>{};
   final Set<Marker> _markers = <Marker>{};
   final Set<Polyline> _polyLines = <Polyline>{};
@@ -586,6 +592,27 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     return widgetId;
+  }
+
+  /// True when any canonical ownership field maps to [uid].
+  bool _rideAssignedToUid(Map<String, dynamic>? ride, String uid) {
+    if (ride == null) {
+      return false;
+    }
+    final normalizedUid = uid.trim();
+    if (normalizedUid.isEmpty) {
+      return false;
+    }
+    for (final key in const <String>[
+      'driver_id',
+      'matched_driver_id',
+      'accepted_driver_id',
+    ]) {
+      if (_valueAsText(ride[key]).trim() == normalizedUid) {
+        return true;
+      }
+    }
+    return false;
   }
 
   @override
@@ -1654,13 +1681,14 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     final canonical =
         TripStateMachine.canonicalStateFromSnapshot(_currentRideData);
     return switch (canonical) {
-      TripLifecycleState.searchingDriver => 'searching',
-      TripLifecycleState.pendingDriverAction => 'assigned',
-      TripLifecycleState.driverAccepted => 'accepted',
-      TripLifecycleState.driverArrived => 'arrived',
-      TripLifecycleState.tripStarted => 'in_progress',
-      TripLifecycleState.tripCompleted => 'completed',
-      TripLifecycleState.tripCancelled => 'cancelled',
+      TripLifecycleState.searching => 'searching',
+      TripLifecycleState.driverAssigned => 'accepted',
+      TripLifecycleState.driverArriving => 'arriving',
+      TripLifecycleState.arrived => 'arrived',
+      TripLifecycleState.inProgress => 'in_progress',
+      TripLifecycleState.completed => 'completed',
+      TripLifecycleState.cancelled => 'cancelled',
+      TripLifecycleState.expired => 'expired',
       _ => _rideStatus,
     };
   }
@@ -2009,7 +2037,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
     }
 
-    if (_valueAsText(ride['driver_id']) != _effectiveDriverId) {
+    if (!_rideAssignedToUid(ride, _effectiveDriverId)) {
       return 'driver_mismatch';
     }
 
@@ -5810,53 +5838,27 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     bool invalidTrip = false,
     bool showMessage = false,
   }) async {
-    final transactionResult =
-        await _rideRequestsRef.child(rideId).runTransaction((currentData) {
-      final currentRide = _asStringDynamicMap(currentData);
-      if (currentRide == null) {
-        return rtdb.Transaction.abort();
-      }
-
-      final currentCanonicalState =
-          TripStateMachine.canonicalStateFromSnapshot(currentRide);
-      if (TripStateMachine.isTerminal(currentCanonicalState)) {
-        return rtdb.Transaction.abort();
-      }
-
-      final updates = TripStateMachine.buildTransitionUpdate(
-        currentRide: currentRide,
-        nextCanonicalState: TripLifecycleState.tripCancelled,
-        timestampValue: rtdb.ServerValue.timestamp,
-        transitionSource: transitionSource,
-        transitionActor: 'system',
-        cancellationActor: 'system',
-        cancellationReason: reason,
-      )..addAll(
-          _cancelledRideSupplementalUpdate(
-            rideData: currentRide,
-            cancelSource: cancelSource,
-            effectiveAt: effectiveAt,
-            invalidTrip: invalidTrip,
-            invalidReason: reason,
-          ),
-        );
-
-      return rtdb.Transaction.success(
-        Map<String, dynamic>.from(currentRide)..addAll(updates),
+    try {
+      final cloud = await _rideCloud.cancelRideRequest(
+        rideId: rideId,
+        cancelReason: reason,
       );
-    }, applyLocally: false);
-
-    if (!transactionResult.committed) {
+      if (!rideCallableSucceeded(cloud)) {
+        _log(
+          'system cancel cloud failed rideId=$rideId reason=${rideCallableReason(cloud)}',
+        );
+        return false;
+      }
+    } catch (error) {
+      _log('system cancel cloud exception rideId=$rideId error=$error');
       return false;
     }
 
-    final committedRide =
-        _asStringDynamicMap(transactionResult.snapshot.value) ?? rideData;
+    final snap = await _rideRequestsRef.child(rideId).get();
+    final committedRide = _asStringDynamicMap(snap.value) ?? rideData;
     await _commitRideAndDriverState(
       rideId: rideId,
-      rideUpdates: <String, dynamic>{
-        'driver_state_synced_at': rtdb.ServerValue.timestamp,
-      },
+      rideUpdates: const <String, dynamic>{},
       driverUpdates: _buildDriverPresenceUpdate(
         status: _isOnline ? 'idle' : 'offline',
         isAvailable: _isOnline,
@@ -7346,183 +7348,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _applyRideLocationsFromData(rideData);
   }
 
-  Future<_MatchedRideRequest?> _reserveRideForPopup({
-    required _MatchedRideRequest ride,
-    required String driverName,
-    required String car,
-    required String plate,
-  }) async {
-    final availabilityReason = await _driverAvailabilityInvalidReason(
-      rideId: ride.rideId,
-      requireRideRequestListener: false,
-    );
-    if (availabilityReason != null) {
-      _log(
-        '[HEALTH] reserve proceeds with warning rideId=${ride.rideId} '
-        'reason=$availabilityReason (no longer blocking reservation)',
-      );
-    }
-
-    final driverId = _effectiveDriverId;
-    if (driverId.isEmpty) {
-      return null;
-    }
-
-    final requestPath = 'ride_requests/${ride.rideId}';
-    final assignmentExpiresAt = DateTime.now().millisecondsSinceEpoch +
-        const Duration(seconds: _kRidePopupCountdownSeconds).inMilliseconds;
-    final rideRef = _rideRequestsRef.child(ride.rideId);
-    String blockedReason = 'unknown';
-    final transactionResult = await rideRef.runTransaction((currentData) {
-      final currentRide = _asStringDynamicMap(currentData);
-      if (currentRide == null) {
-        blockedReason = 'ride_missing';
-        return rtdb.Transaction.abort();
-      }
-
-      final currentCanonicalState = TripStateMachine.canonicalStateFromSnapshot(
-        currentRide,
-      );
-      if (TripStateMachine.isPendingDriverAssignmentState(
-              currentCanonicalState) &&
-          _valueAsText(currentRide['driver_id']) == driverId &&
-          !_assignmentHasExpired(currentRide)) {
-        return rtdb.Transaction.success(Map<String, dynamic>.from(currentRide));
-      }
-
-      final reservationReason =
-          _popupServerSkipReason(ride.rideId, currentRide);
-      if (reservationReason != null) {
-        blockedReason = reservationReason;
-        return rtdb.Transaction.abort();
-      }
-
-      final transitionUpdates = TripStateMachine.buildTransitionUpdate(
-        currentRide: currentRide,
-        nextCanonicalState: TripLifecycleState.pendingDriverAction,
-        timestampValue: rtdb.ServerValue.timestamp,
-        transitionSource: 'driver_assignment_reserve',
-        transitionActor: 'system',
-      );
-
-      return rtdb.Transaction.success(
-        Map<String, dynamic>.from(currentRide)
-          ..addAll(transitionUpdates)
-          ..addAll(<String, dynamic>{
-            'driver_id': driverId,
-            'driver_name': driverName,
-            'car': car,
-            'plate': plate,
-            'status': _kPendingDriverAcceptanceStatus,
-            // Drop open-pool index fields so other drivers' discovery queries stay valid.
-            'market': null,
-            'market_pool': null,
-            'driver_notified_at': rtdb.ServerValue.timestamp,
-            'driver_matched_at': rtdb.ServerValue.timestamp,
-            'matched_driver_id': driverId,
-            'assignment_expires_at': assignmentExpiresAt,
-            'driver_response_timeout_at': assignmentExpiresAt,
-            'assignment_timeout_ms': const Duration(
-              seconds: _kRidePopupCountdownSeconds,
-            ).inMilliseconds,
-          }),
-      );
-    }, applyLocally: false);
-
-    if (!transactionResult.committed) {
-      final latestRideData =
-          _asStringDynamicMap(transactionResult.snapshot.value);
-      final latestBlockedReason = blockedReason != 'unknown'
-          ? blockedReason
-          : (_popupServerSkipReason(ride.rideId, latestRideData) ??
-              'assignment_not_committed');
-      _logRtdb(
-        'assignment blocked rideId=${ride.rideId} reason=$latestBlockedReason',
-      );
-      _logRideReq(
-        '[MATCH_DEBUG][DRIVER_DECISION] decision=rejected rideId=${ride.rideId} '
-        'status=${latestRideData == null ? 'unknown' : TripStateMachine.uiStatusFromSnapshot(latestRideData)} '
-        'reason=$latestBlockedReason stage=reserve_popup',
-      );
-      return null;
-    }
-
-    final reservedRideData =
-        _asStringDynamicMap(transactionResult.snapshot.value);
-    if (reservedRideData == null) {
-      return null;
-    }
-
-    final matchedRide = _matchRideForPopup(
-      ride.rideId,
-      reservedRideData,
-      ignoreLocalState: true,
-      logSkips: false,
-    );
-    if (matchedRide == null) {
-      await _releaseAssignedRideIfNeeded(
-        rideId: ride.rideId,
-        reason: 'assignment_payload_invalid',
-      );
-      return null;
-    }
-
-    try {
-      await _commitRideAndDriverState(
-        rideId: ride.rideId,
-        rideUpdates: const <String, dynamic>{},
-        driverUpdates: _buildDriverPresenceUpdate(
-          status: _kPendingDriverAcceptanceStatus,
-          activeRideId: ride.rideId,
-          isAvailable: false,
-        ),
-        activeRideUpdates: <String, Object?>{
-          'ride_id': ride.rideId,
-          'status': _kPendingDriverAcceptanceStatus,
-          'trip_state': TripLifecycleState.pendingDriverAction,
-          'updated_at': rtdb.ServerValue.timestamp,
-        },
-      );
-    } catch (error) {
-      _logRtdb(
-        'assignment sync failed rideId=${ride.rideId} path=$requestPath error=$error',
-      );
-      await _releaseAssignedRideIfNeeded(
-        rideId: ride.rideId,
-        reason: 'assignment_state_sync_failed',
-      );
-      return null;
-    }
-
-    _syncPendingRidePreviewLocalState(
-        rideId: ride.rideId, rideData: reservedRideData);
-    _logRtdb(
-      'assignment reserved rideId=${ride.rideId} path=$requestPath driverId=$driverId',
-    );
-    _logRideReq(
-      '[MATCH_DEBUG][DRIVER_DECISION] decision=accepted_for_popup rideId=${ride.rideId} '
-      'status=${TripStateMachine.uiStatusFromSnapshot(reservedRideData)} stage=reserve_popup',
-    );
-    unawaited(
-      _driverTripSafetyService
-          .logRideStateChange(
-        rideId: ride.rideId,
-        riderId: _valueAsText(reservedRideData['rider_id']),
-        driverId: driverId,
-        serviceType: _serviceTypeKey(reservedRideData['service_type']),
-        status: _kPendingDriverAcceptanceStatus,
-        source: 'driver_popup_reserved',
-        rideData: reservedRideData,
-      )
-          .catchError((Object error) {
-        _log(
-          'assignment telemetry failed rideId=${ride.rideId} error=$error',
-        );
-      }),
-    );
-    return matchedRide;
-  }
-
   Future<bool> _releaseAssignedRideIfNeeded({
     required String rideId,
     required String reason,
@@ -7537,90 +7362,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       '[MATCH_DEBUG][ASSIGNMENT_RELEASE] rideId=$rideId driverId=$driverId reason=$reason',
     );
 
-    final rideRef = _rideRequestsRef.child(rideId);
-    late final rtdb.TransactionResult transactionResult;
-    try {
-      transactionResult = await rideRef.runTransaction((currentData) {
-        final currentRide = _asStringDynamicMap(currentData);
-        if (currentRide == null) {
-          return rtdb.Transaction.abort();
-        }
-
-        final currentCanonicalState =
-            TripStateMachine.canonicalStateFromSnapshot(
-          currentRide,
-        );
-        if (!TripStateMachine.isPendingDriverAssignmentState(
-                currentCanonicalState) ||
-            _valueAsText(currentRide['driver_id']) != driverId) {
-          return rtdb.Transaction.abort();
-        }
-
-        final updates = TripStateMachine.buildTransitionUpdate(
-          currentRide: currentRide,
-          nextCanonicalState: TripLifecycleState.searchingDriver,
-          timestampValue: rtdb.ServerValue.timestamp,
-          transitionSource: 'driver_assignment_release',
-          transitionActor: 'system',
-        );
-
-        final reindexMarket = _rideMarketFromData(currentRide);
-        return rtdb.Transaction.success(
-          Map<String, dynamic>.from(currentRide)
-            ..addAll(updates)
-            ..addAll(<String, dynamic>{
-              'driver_id': 'waiting',
-              'driver_name': null,
-              'car': null,
-              'plate': null,
-              'rating': null,
-              'driver_lat': null,
-              'driver_lng': null,
-              'driver_heading': null,
-              'assignment_expires_at': null,
-              'driver_response_timeout_at': null,
-              'assignment_timeout_ms': null,
-              'last_assignment_driver_id': driverId,
-              'last_assignment_release_reason': reason,
-              if (reindexMarket != null &&
-                  reindexMarket.isNotEmpty) ...<String, dynamic>{
-                'market': reindexMarket,
-                'market_pool': reindexMarket,
-              },
-            }),
-        );
-      }, applyLocally: false);
-    } catch (error) {
-      final code = error is FirebaseException ? error.code : 'unknown';
-      _logRtdb(
-        '[RTDB_WRITE] phase=error operation=transaction_assignment_release '
-        'rideId=$rideId uid=$driverId path=ride_requests/$rideId code=$code error=$error',
-      );
-      return false;
-    }
-
-    if (!transactionResult.committed) {
-      return false;
-    }
-
-    try {
-      await _commitRideAndDriverState(
-        rideId: rideId,
-        rideUpdates: const <String, dynamic>{},
-        driverUpdates: _buildDriverPresenceUpdate(
-          status: 'idle',
-          isAvailable: true,
-        ),
-        clearActiveRide: true,
-      );
-    } catch (error) {
-      final code = error is FirebaseException ? error.code : 'unknown';
-      _logRtdb(
-        '[RTDB_WRITE] phase=error operation=post_assignment_release_presence '
-        'rideId=$rideId uid=$driverId code=$code error=$error',
-      );
-    }
-
     if (resetLocalState &&
         (_driverActiveRideId == rideId || _currentRideId == rideId)) {
       await _clearActiveRideState(
@@ -7629,28 +7370,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
     }
 
-    _logRtdb('assignment released rideId=$rideId reason=$reason');
-    unawaited(
-      _driverTripSafetyService
-          .logRideStateChange(
-        rideId: rideId,
-        riderId: _valueAsText(
-          transactionResult.snapshot.child('rider_id').value,
-        ),
-        driverId: driverId,
-        serviceType: _serviceTypeKey(
-          transactionResult.snapshot.child('service_type').value,
-        ),
-        status: 'searching',
-        source: 'driver_assignment_release_$reason',
-        rideData: _asStringDynamicMap(transactionResult.snapshot.value),
-      )
-          .catchError((Object error) {
-        _log(
-          'assignment release telemetry failed rideId=$rideId error=$error',
-        );
-      }),
-    );
+    _logRtdb('assignment release local rideId=$rideId reason=$reason');
     return true;
   }
 
@@ -7779,6 +7499,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     required String reason,
     bool resetTripState = false,
   }) async {
+    _driverEnrouteCloudSentRideId = null;
     final rideId = _driverActiveRideId ?? _currentRideId ?? _callListenerRideId;
     if (rideId != null && rideId.isNotEmpty) {
       final normalizedReason = reason.toLowerCase();
@@ -8134,9 +7855,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       'ride_chats/$normalizedRideId/status': status,
       'ride_chats/$normalizedRideId/updated_at': now,
       'ride_chats/$normalizedRideId/created_at': now,
-      'ride_requests/$normalizedRideId/chat_ready': true,
-      'ride_requests/$normalizedRideId/chat_ready_at': now,
     });
+    unawaited(
+      _rideCloud.patchRideRequestMetadata(
+        rideId: normalizedRideId,
+        patch: <String, dynamic>{
+          'chat_ready': true,
+          'chat_ready_at': DateTime.now().millisecondsSinceEpoch,
+        },
+      ),
+    );
   }
 
   Future<void> _mirrorDriverChatToTripRouteLog({
@@ -9557,65 +9285,50 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           if (_currentRideId != null) {
             final activeRideId = _currentRideId!;
             final currentRide = _currentRideData;
-            final currentCanonicalState = currentRide == null
-                ? TripLifecycleState.searchingDriver
-                : TripStateMachine.canonicalStateFromSnapshot(currentRide);
-            final canSyncRideLocation = currentRide != null &&
-                !TripStateMachine.isPendingDriverAssignmentState(
-                  currentCanonicalState,
-                );
-            final shouldPromoteToArriving = canSyncRideLocation &&
-                currentCanonicalState == TripLifecycleState.driverAccepted;
-            if (canSyncRideLocation) {
-              final rideUpdates = <String, dynamic>{
-                'driver_lat': position.latitude,
-                'driver_lng': position.longitude,
-                'updated_at': rtdb.ServerValue.timestamp,
-              };
-              if (shouldPromoteToArriving) {
-                rideUpdates.addAll(
-                  TripStateMachine.buildTransitionUpdate(
-                    currentRide: currentRide,
-                    nextCanonicalState: TripLifecycleState.driverArriving,
-                    timestampValue: rtdb.ServerValue.timestamp,
-                    transitionSource: 'driver_location_en_route',
-                    transitionActor: 'driver',
-                  ),
-                );
-              }
-
-              await _rideRequestsRef.child(activeRideId).update(rideUpdates);
-              if (shouldPromoteToArriving) {
-                await _commitRideAndDriverState(
-                  rideId: activeRideId,
-                  rideUpdates: <String, dynamic>{},
-                  driverUpdates: _buildDriverPresenceUpdate(
-                    status: 'arriving',
-                    activeRideId: activeRideId,
-                    isAvailable: false,
-                  ),
-                  activeRideUpdates: <String, Object?>{
-                    'ride_id': activeRideId,
-                    'status': 'arriving',
-                    'trip_state': TripLifecycleState.driverArriving,
-                    'updated_at': rtdb.ServerValue.timestamp,
-                  },
-                );
-                final nextRideData = Map<String, dynamic>.from(currentRide)
-                  ..addAll(<String, dynamic>{
-                    'status': 'arriving',
-                    'trip_state': TripLifecycleState.driverArriving,
-                  });
-                if (mounted) {
-                  _setStateSafely(() {
-                    _rideStatus = 'arriving';
-                    _currentRideData = nextRideData;
-                  });
-                } else {
-                  _rideStatus = 'arriving';
-                  _currentRideData = nextRideData;
+            if (currentRide != null) {
+              final currentCanonicalState =
+                  TripStateMachine.canonicalStateFromSnapshot(currentRide);
+              final shouldCallDriverEnroute =
+                  currentCanonicalState == TripLifecycleState.driverAssigned &&
+                      _driverEnrouteCloudSentRideId != activeRideId;
+              if (shouldCallDriverEnroute) {
+                try {
+                  final resp =
+                      await _rideCloud.driverEnroute(rideId: activeRideId);
+                  if (rideCallableSucceeded(resp)) {
+                    _driverEnrouteCloudSentRideId = activeRideId;
+                    await _commitRideAndDriverState(
+                      rideId: activeRideId,
+                      rideUpdates: const <String, dynamic>{},
+                      driverUpdates: _buildDriverPresenceUpdate(
+                        status: 'arriving',
+                        activeRideId: activeRideId,
+                        isAvailable: false,
+                      ),
+                    );
+                    final nextRideData = Map<String, dynamic>.from(currentRide)
+                      ..addAll(<String, dynamic>{
+                        'status': 'arriving',
+                        'trip_state': TripLifecycleState.driverArriving,
+                      });
+                    if (mounted) {
+                      _setStateSafely(() {
+                        _rideStatus = 'arriving';
+                        _currentRideData = nextRideData;
+                      });
+                    } else {
+                      _rideStatus = 'arriving';
+                      _currentRideData = nextRideData;
+                    }
+                    _log(
+                      'driver en route via cloud function rideId=$activeRideId',
+                    );
+                  }
+                } catch (error) {
+                  _log(
+                    'driverEnroute cloud call failed rideId=$activeRideId error=$error',
+                  );
                 }
-                _log('driver en route state promoted rideId=$activeRideId');
               }
               await _maybeLogDriverTelemetryCheckpoint();
             }
@@ -9695,6 +9408,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           'uid': authUid,
           'market': targetMarket,
           'market_pool': targetMarket,
+          'dispatch_market': targetMarket,
           'city': targetMarket,
           'updated_at': rtdb.ServerValue.timestamp,
         });
@@ -9714,6 +9428,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         await profileRef.update({
           'market': market,
           'market_pool': market,
+          'dispatch_market': market,
           'city': market,
           'launch_market_city': market,
           'launch_market_updated_at': rtdb.ServerValue.timestamp,
@@ -11855,6 +11570,13 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         );
         return false;
       }
+      _logRideReq(
+        '[ACCEPT_DEBUG_PRE] rideId=$rideId path=ride_requests/$rideId '
+        'snapshotExists=${preflightSnapshot.exists} '
+        'status=${_valueAsText(preflightRideData['status'])} '
+        'driver_id=${_valueAsText(preflightRideData['driver_id'])} '
+        'trip_state=${_valueAsText(preflightRideData['trip_state'])}',
+      );
       final simulatedAccept = await _backendSimulation.acceptTrip(
         BackendAcceptRequest(
           rideId: rideId,
@@ -11887,7 +11609,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
       print('ACCEPT_CALL_PAYLOAD driverId=$driverId authUid=${authUser.uid}');
       final functions = FirebaseFunctions.instanceFor(region: 'us-central1');
-      final callable = functions.httpsCallable('acceptRide');
+      final callable = functions.httpsCallable('acceptRideRequest');
       final callableResult = await callable.call(callablePayload);
       final callableResponse = _asStringDynamicMap(callableResult.data);
       final acceptOk = callableResponse?['success'] == true;
@@ -11904,12 +11626,55 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         );
       }
 
-      final latestRideData = _asStringDynamicMap((await ref.get()).value);
-      Map<String, dynamic>? ridePayload = latestRideData;
-      if (ridePayload != null &&
-          _valueAsText(ridePayload['driver_id']) != driverId) {
-        ridePayload = null;
+      Map<String, dynamic>? latestRideData;
+      Map<String, dynamic>? ridePayload;
+      const maxSnapAttempts = 6;
+      const snapBackoff = Duration(milliseconds: 100);
+      for (var attempt = 0; attempt < maxSnapAttempts; attempt++) {
+        if (attempt > 0) {
+          await Future<void>.delayed(snapBackoff);
+        }
+        latestRideData = _asStringDynamicMap((await ref.get()).value);
+        if (latestRideData != null && _rideAssignedToUid(latestRideData, driverId)) {
+          ridePayload = latestRideData;
+          break;
+        }
       }
+
+      final payloadForAcceptTrust = ridePayload;
+      if (acceptOk &&
+          (payloadForAcceptTrust == null ||
+              !_rideAssignedToUid(payloadForAcceptTrust, driverId))) {
+        ridePayload = Map<String, dynamic>.from(preflightRideData)
+          ..['driver_id'] = driverId
+          ..['matched_driver_id'] = driverId
+          ..['accepted_driver_id'] = driverId
+          ..['status'] = 'accepted'
+          ..['trip_state'] = TripLifecycleState.driverAssigned
+          ..['accepted_at'] = DateTime.now().millisecondsSinceEpoch
+          ..['updated_at'] = DateTime.now().millisecondsSinceEpoch;
+        _logRideReq(
+          '[ACCEPT_FALLBACK_PAYLOAD] rideId=$rideId reason=api_success_stale_snapshot',
+        );
+      }
+
+      if (!acceptOk &&
+          ridePayload == null &&
+          latestRideData != null &&
+          _rideAssignedToUid(latestRideData, driverId)) {
+        ridePayload = latestRideData;
+      }
+
+      _logRideReq(
+        '[ACCEPT_DEBUG_POST] rideId=$rideId path=ride_requests/$rideId '
+        'apiOk=$acceptOk '
+        'apiReason=${blockedReason.isEmpty ? 'none' : blockedReason} '
+        'rtdbAfterExists=${latestRideData != null} '
+        'statusAfter=${latestRideData == null ? 'null' : _valueAsText(latestRideData['status'])} '
+        'driverIdAfter=${latestRideData == null ? 'null' : _valueAsText(latestRideData['driver_id'])} '
+        'tripStateAfter=${latestRideData == null ? 'null' : _valueAsText(latestRideData['trip_state'])} '
+        'committedForDriver=${ridePayload != null}',
+      );
 
       if (ridePayload == null) {
         if (_terminalSelfAcceptedRideIds.contains(rideId.trim())) {
@@ -11977,9 +11742,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         final committedCanonicalState =
             TripStateMachine.canonicalStateFromSnapshot(ridePayload);
         final assignedHere =
-            _valueAsText(ridePayload['driver_id']) == _effectiveDriverId;
+            _rideAssignedToUid(ridePayload, _effectiveDriverId);
         final treatAsSoftFailure = assignedHere &&
-            TripStateMachine.isDriverActiveState(committedCanonicalState);
+            (TripStateMachine.isDriverActiveState(committedCanonicalState) ||
+                TripStateMachine.isPendingDriverAssignmentState(
+                    committedCanonicalState));
         if (treatAsSoftFailure) {
           _log(
             '[HEALTH] post_accept_payload_warning rideId=$rideId reason=$committedRideReason '
@@ -12318,34 +12085,27 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     );
 
     try {
-      final currentRide = _currentRideData == null
-          ? <String, dynamic>{'status': _rideStatus}
-          : Map<String, dynamic>.from(_currentRideData!);
-      final rideUpdates = TripStateMachine.buildTransitionUpdate(
-        currentRide: currentRide,
-        nextCanonicalState: TripLifecycleState.driverArrived,
-        timestampValue: rtdb.ServerValue.timestamp,
-        transitionSource: 'driver_arrived',
-        transitionActor: 'driver',
-      );
+      final cloud = await _rideCloud.driverArrived(rideId: currentRideId);
+      if (!rideCallableSucceeded(cloud)) {
+        _showSnackBarSafely(
+          SnackBar(
+            content: Text(
+              'Unable to mark arrival (${rideCallableReason(cloud)}).',
+            ),
+          ),
+        );
+        return;
+      }
       await _commitRideAndDriverState(
         rideId: currentRideId,
-        rideUpdates: rideUpdates,
+        rideUpdates: const <String, dynamic>{},
         driverUpdates: _buildDriverPresenceUpdate(
           status: 'arrived',
           activeRideId: currentRideId,
           isAvailable: false,
         ),
-        activeRideUpdates: <String, Object?>{
-          'ride_id': currentRideId,
-          'status': 'arrived',
-          'trip_state': TripLifecycleState.driverArrived,
-          'updated_at': rtdb.ServerValue.timestamp,
-        },
       );
-      _log('arrived ride update success rideId=$currentRideId');
-      _log('arrived driver update success rideId=$currentRideId');
-      _log('arrived active ride marker success rideId=$currentRideId');
+      _log('arrived cloud success rideId=$currentRideId');
     } catch (error) {
       _log('arrived failed rideId=$currentRideId error=$error');
       _showSnackBarSafely(
@@ -12360,7 +12120,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         ? <String, dynamic>{}
         : Map<String, dynamic>.from(_currentRideData!);
     nextRideData['status'] = 'arrived';
-    nextRideData['trip_state'] = TripLifecycleState.driverArrived;
+    nextRideData['trip_state'] = TripLifecycleState.arrived;
 
     if (mounted) {
       setState(() {
@@ -12423,48 +12183,27 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _log('start trip tapped rideId=$currentRideId status=$_rideStatus');
 
     try {
-      final currentRide = _currentRideData == null
-          ? <String, dynamic>{'status': _rideStatus}
-          : Map<String, dynamic>.from(_currentRideData!);
-      final rideUpdates = TripStateMachine.buildTransitionUpdate(
-        currentRide: currentRide,
-        nextCanonicalState: TripLifecycleState.tripStarted,
-        timestampValue: rtdb.ServerValue.timestamp,
-        transitionSource: 'driver_start_trip',
-        transitionActor: 'driver',
-      )..addAll(<String, dynamic>{
-          'start_timeout_at': null,
-          'route_log_timeout_at': DateTime.now().millisecondsSinceEpoch +
-              TripStateMachine.routeLogTimeout.inMilliseconds,
-          'has_started_route_checkpoints': false,
-          'route_log_trip_started_checkpoint_at': null,
-        });
-      if (_isDispatchDeliveryService(serviceType)) {
-        rideUpdates['pickupConfirmedAt'] = rtdb.ServerValue.timestamp;
-        rideUpdates['deliveryProofStatus'] = 'pending';
-        rideUpdates['dispatch_details/pickupConfirmedAt'] =
-            rtdb.ServerValue.timestamp;
-        rideUpdates['dispatch_details/deliveryProofStatus'] = 'pending';
+      final cloud = await _rideCloud.startTrip(rideId: currentRideId);
+      if (!rideCallableSucceeded(cloud)) {
+        _showSnackBarSafely(
+          SnackBar(
+            content: Text(
+              'Unable to start trip (${rideCallableReason(cloud)}).',
+            ),
+          ),
+        );
+        return;
       }
-
       await _commitRideAndDriverState(
         rideId: currentRideId,
-        rideUpdates: rideUpdates,
+        rideUpdates: const <String, dynamic>{},
         driverUpdates: _buildDriverPresenceUpdate(
           status: 'on_trip',
           activeRideId: currentRideId,
           isAvailable: false,
         ),
-        activeRideUpdates: <String, Object?>{
-          'ride_id': currentRideId,
-          'status': 'on_trip',
-          'trip_state': TripLifecycleState.tripStarted,
-          'updated_at': rtdb.ServerValue.timestamp,
-        },
       );
-      _log('start trip ride update success rideId=$currentRideId');
-      _log('start trip driver update success rideId=$currentRideId');
-      _log('start trip active ride marker success rideId=$currentRideId');
+      _log('start trip cloud success rideId=$currentRideId');
     } catch (error) {
       _log('start trip failed rideId=$currentRideId error=$error');
       _showSnackBarSafely(
@@ -12480,7 +12219,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         ? <String, dynamic>{}
         : Map<String, dynamic>.from(_currentRideData!);
     nextRideData['status'] = 'on_trip';
-    nextRideData['trip_state'] = TripLifecycleState.tripStarted;
+    nextRideData['trip_state'] = TripLifecycleState.inProgress;
     nextRideData['start_timeout_at'] = null;
     nextRideData['route_log_timeout_at'] =
         DateTime.now().millisecondsSinceEpoch +
@@ -12636,27 +12375,23 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     );
 
     try {
-      final rideUpdates = TripStateMachine.buildTransitionUpdate(
-        currentRide: currentRide,
-        nextCanonicalState: TripLifecycleState.tripCancelled,
-        timestampValue: rtdb.ServerValue.timestamp,
-        transitionSource: 'driver_cancel',
-        transitionActor: 'driver',
-        cancellationActor: 'driver',
-        cancellationReason: cancelReason.trim(),
-      )..addAll(<String, dynamic>{
-          'driver_id': _effectiveDriverId,
-          'cancelled_by': 'driver',
-          'cancelled_at': rtdb.ServerValue.timestamp,
-          ..._cancelledRideSupplementalUpdate(
-            rideData: currentRide,
-            cancelSource: 'driver_cancel',
+      final cloud = await _rideCloud.cancelRideRequest(
+        rideId: currentRideId,
+        cancelReason: cancelReason.trim(),
+      );
+      if (!rideCallableSucceeded(cloud)) {
+        _showSnackBarSafely(
+          SnackBar(
+            content: Text(
+              'Unable to cancel (${rideCallableReason(cloud)}).',
+            ),
           ),
-        });
-
+        );
+        return;
+      }
       await _commitRideAndDriverState(
         rideId: currentRideId,
-        rideUpdates: rideUpdates,
+        rideUpdates: const <String, dynamic>{},
         driverUpdates: _buildDriverPresenceUpdate(
           status: 'idle',
           isAvailable: true,
@@ -12769,19 +12504,6 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return;
     }
 
-    final completeResult = await _backendSimulation.completeTrip(
-      BackendCompleteTripRequest(
-        rideId: currentRideId,
-        rideSnapshot: completedRideData,
-        serviceType: serviceType,
-      ),
-    );
-    if (!completeResult.ok) {
-      _setApiStatus('failed', errorMessage: completeResult.message);
-      _showSnackBarSafely(SnackBar(content: Text(completeResult.message)));
-      return;
-    }
-
     final hasStartedCheckpointLogs = await _rideHasStartedCheckpointLogs(
       currentRideId,
       rideData: completedRideData,
@@ -12799,50 +12521,36 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return;
     }
 
-    final paymentMethod = _paymentMethodFromRide(completedRideData);
-    final businessModel = await _resolveDriverBusinessModelForSettlement(
-      source: 'complete_trip',
-    );
-    final settlement = _buildRideSettlementRecord(
-      rideData: completedRideData,
-      businessModel: businessModel,
-      settlementStatus: 'trip_completed',
-      completionState: 'driver_marked_completed',
-      paymentMethod: paymentMethod,
-    );
-    final settledRideData = <String, dynamic>{
-      ...completedRideData,
-      'settlement': settlement,
-      'grossFare': settlement['grossFareNgn'] ?? 0,
-      'commission': settlement['commissionAmountNgn'] ?? 0,
-      'commissionAmount': settlement['commissionAmountNgn'] ?? 0,
-      'driverPayout': settlement['driverPayoutNgn'] ?? 0,
-      'netEarning': settlement['netEarningNgn'] ?? 0,
-    };
-
-    final rideUpdates = TripStateMachine.buildTransitionUpdate(
-      currentRide: completedRideData,
-      nextCanonicalState: TripLifecycleState.tripCompleted,
-      timestampValue: rtdb.ServerValue.timestamp,
-      transitionSource: 'driver_complete_trip',
-      transitionActor: 'driver',
-    )..addAll(<String, dynamic>{
-        'driver_id': _effectiveDriverId,
-        'completed_driver_id': _effectiveDriverId,
-        'trip_completed': true,
-        'settlement': settlement,
-        'grossFare': settlement['grossFareNgn'] ?? 0,
-        'commission': settlement['commissionAmountNgn'] ?? 0,
-        'commissionAmount': settlement['commissionAmountNgn'] ?? 0,
-        'driverPayout': settlement['driverPayoutNgn'] ?? 0,
-        'netEarning': settlement['netEarningNgn'] ?? 0,
-      });
-    if (isDispatchDelivery) {
-      rideUpdates['deliveredAt'] = rtdb.ServerValue.timestamp;
-      rideUpdates['deliveryProofStatus'] = 'submitted';
-      rideUpdates['dispatch_details/deliveredAt'] = rtdb.ServerValue.timestamp;
-      rideUpdates['dispatch_details/deliveryProofStatus'] = 'submitted';
+    final cloudComplete = await _rideCloud.completeTrip(rideId: currentRideId);
+    if (!rideCallableSucceeded(cloudComplete)) {
+      _setApiStatus('failed', errorMessage: rideCallableReason(cloudComplete));
+      _showSnackBarSafely(
+        SnackBar(
+          content: Text(
+            'Unable to complete trip (${rideCallableReason(cloudComplete)}).',
+          ),
+        ),
+      );
+      return;
     }
+
+    if (isDispatchDelivery) {
+      await _rideCloud.patchRideRequestMetadata(
+        rideId: currentRideId,
+        patch: <String, dynamic>{
+          'deliveredAt': DateTime.now().millisecondsSinceEpoch,
+          'deliveryProofStatus': 'submitted',
+          'dispatch_details/deliveredAt': DateTime.now().millisecondsSinceEpoch,
+          'dispatch_details/deliveryProofStatus': 'submitted',
+        },
+      );
+    }
+
+    final refreshedSnap = await _rideRequestsRef.child(currentRideId).get();
+    final settledRideData =
+        _asStringDynamicMap(refreshedSnap.value) ?? completedRideData;
+    final settlement = _asStringDynamicMap(settledRideData['settlement']);
+    final paymentMethod = _paymentMethodFromRide(settledRideData);
 
     final completedDriverPresence = _buildDriverPresenceUpdate(
       status: 'idle',
@@ -12851,12 +12559,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     completedDriverPresence['latest_trip_ride_id'] = currentRideId;
     completedDriverPresence['latest_trip_status'] = 'completed';
     completedDriverPresence['latest_trip_trip_state'] =
-        TripLifecycleState.tripCompleted;
+        TripLifecycleState.completed;
     completedDriverPresence['latest_trip_at'] = rtdb.ServerValue.timestamp;
 
     await _commitRideAndDriverState(
       rideId: currentRideId,
-      rideUpdates: rideUpdates,
+      rideUpdates: const <String, dynamic>{},
       driverUpdates: completedDriverPresence,
       clearActiveRide: true,
     );
@@ -13462,13 +13170,16 @@ class _DriverMapScreenState extends State<DriverMapScreen>
 
   Future<void> _publishRiderSuddenStopSafetyAlert(String rideId) async {
     try {
-      await _rideRequestsRef.child(rideId).update(<String, dynamic>{
-        'rider_safety_alert': <String, dynamic>{
-          'type': 'sudden_stop',
-          'issued_at': DateTime.now().millisecondsSinceEpoch,
-          'source': 'driver_device',
+      await _rideCloud.patchRideRequestMetadata(
+        rideId: rideId,
+        patch: <String, dynamic>{
+          'rider_safety_alert': <String, dynamic>{
+            'type': 'sudden_stop',
+            'issued_at': DateTime.now().millisecondsSinceEpoch,
+            'source': 'driver_device',
+          },
         },
-      });
+      );
     } catch (error) {
       _logSafety(
           'rider_safety_alert publish failed rideId=$rideId error=$error');
@@ -14689,15 +14400,18 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         },
       );
 
-      await _rideRequestsRef.child(currentRideId).update(<String, dynamic>{
-        'deliveryProofPhotoUrl': uploadedPhoto.fileUrl,
-        'deliveryProofSubmittedAt': rtdb.ServerValue.timestamp,
-        'deliveryProofStatus': 'submitted',
-        'dispatch_details/deliveryProofPhotoUrl': uploadedPhoto.fileUrl,
-        'dispatch_details/deliveryProofSubmittedAt': rtdb.ServerValue.timestamp,
-        'dispatch_details/deliveryProofStatus': 'submitted',
-        'updated_at': rtdb.ServerValue.timestamp,
-      });
+      await _rideCloud.patchRideRequestMetadata(
+        rideId: currentRideId,
+        patch: <String, dynamic>{
+          'deliveryProofPhotoUrl': uploadedPhoto.fileUrl,
+          'deliveryProofSubmittedAt': DateTime.now().millisecondsSinceEpoch,
+          'deliveryProofStatus': 'submitted',
+          'dispatch_details/deliveryProofPhotoUrl': uploadedPhoto.fileUrl,
+          'dispatch_details/deliveryProofSubmittedAt':
+              DateTime.now().millisecondsSinceEpoch,
+          'dispatch_details/deliveryProofStatus': 'submitted',
+        },
+      );
 
       if (mounted) {
         setState(() {

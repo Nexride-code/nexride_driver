@@ -158,201 +158,46 @@ async function createWalletTransactionInternal({
   return { success: true, reason: "wallet_updated", transactionId };
 }
 
-/** Matches driver open-pool + matchmaking tokens (see rtdb_ride_request_contract.dart). */
-const ACCEPT_FROM_OPEN_POOL_STATUSES = new Set([
-  "requested",
-  "requesting",
-  "searching_driver",
-  "searching",
-  "awaiting_match",
-  "matching",
-  "offered",
-  "offer_pending",
-  // Rider lifecycle labels observed while rider_id is assigned but driver slot is empty.
-  "assigned",
-  "driver_assigned",
-  "matched",
-  "driver_found",
-  "driver_matched",
-  "driver_found_pending",
-]);
+const ride = require("./ride_callables");
 
-const RESERVED_FOR_DRIVER_STATUSES = new Set([
-  "pending_driver_acceptance",
-  "pending_driver_action",
-  "driver_reviewing_request",
-]);
+exports.createRideRequest = functions.https.onCall(async (data, context) =>
+  ride.createRideRequest(data, context, db),
+);
 
-function normUid(uid) {
-  return String(uid ?? "").trim();
-}
+exports.acceptRideRequest = functions.https.onCall(async (data, context) =>
+  ride.acceptRideRequest(data, context, db),
+);
 
-exports.acceptRide = functions.https.onCall(async (data, context) => {
-  const rideId = String(data?.rideId ?? "").trim();
-  const driverId = normUid(data?.driverId);
-  const authUid = normUid(context.auth?.uid);
+/** @deprecated Use acceptRideRequest — kept for older client builds */
+exports.acceptRide = exports.acceptRideRequest;
 
-  if (!rideId || !driverId) {
-    return { success: false, reason: "invalid_input" };
-  }
+exports.driverEnroute = functions.https.onCall(async (data, context) =>
+  ride.driverEnroute(data, context, db),
+);
 
-  if (!context.auth || authUid !== driverId) {
-    return { success: false, reason: "unauthorized" };
-  }
+exports.driverArrived = functions.https.onCall(async (data, context) =>
+  ride.driverArrived(data, context, db),
+);
 
-  const ridePath = `ride_requests/${rideId}`;
-  const rideRef = admin.database().ref(ridePath);
-  const now = Date.now();
-  let failureReason = "unknown";
-  let idempotent = false;
+exports.startTrip = functions.https.onCall(async (data, context) =>
+  ride.startTrip(data, context, db),
+);
 
-  const preSnap = await rideRef.get();
-  const preVal = preSnap.val();
-  const preOk = preVal != null && typeof preVal === "object";
-  console.log("ACCEPT_RIDE_PREFLIGHT", {
-    rideId,
-    path: ridePath,
-    exists: preOk,
-    status: preOk ? preVal.status : null,
-    driver_id: preOk ? preVal.driver_id : null,
-    trip_state: preOk ? preVal.trip_state : null,
-  });
+exports.completeTrip = functions.https.onCall(async (data, context) =>
+  ride.completeTrip(data, context, db),
+);
 
-  if (!preOk) {
-    console.log("ACCEPT_RIDE_FAIL", { rideId, path: ridePath, stage: "preflight", reason: "ride_missing" });
-    return { success: false, reason: "ride_missing" };
-  }
+exports.cancelRideRequest = functions.https.onCall(async (data, context) =>
+  ride.cancelRideRequest(data, context, db),
+);
 
-  const tx = await rideRef.transaction((current) => {
-    if (!current || typeof current !== "object") {
-      failureReason = "ride_missing";
-      return;
-    }
+exports.expireRideRequest = functions.https.onCall(async (data, context) =>
+  ride.expireRideRequest(data, context, db),
+);
 
-    const status = String(current.status ?? "").trim().toLowerCase();
-    const rawDriverId = current.driver_id;
-    const rawAcceptedDriverId = current.accepted_driver_id;
-    const assignedDriverId = normUid(rawDriverId);
-    const acceptedDriverId = normUid(rawAcceptedDriverId);
-    const expiresAtRaw = current.request_expires_at ?? current.expires_at ?? 0;
-    const expiresAt = Number(expiresAtRaw) || 0;
-
-    const assignmentExpiresRaw =
-      current.assignment_expires_at ?? current.driver_response_timeout_at ?? 0;
-    const assignmentExpiresAt = Number(assignmentExpiresRaw) || 0;
-
-    const isPlaceholderUnassigned = (value) =>
-      value === null ||
-      value === undefined ||
-      String(value).trim() === "" ||
-      String(value).trim().toLowerCase() === "waiting" ||
-      String(value).trim().toLowerCase() === "pending";
-    const isUnassigned =
-      isPlaceholderUnassigned(rawDriverId) &&
-      isPlaceholderUnassigned(rawAcceptedDriverId);
-    console.log("ACCEPT_RIDE_DRIVER_FIELD", {
-      rideId,
-      path: ridePath,
-      rawDriverId,
-      rawAcceptedDriverId,
-      isUnassigned,
-      status,
-      authUid,
-    });
-
-    const alreadyAcceptedBySelf =
-      (assignedDriverId === authUid || acceptedDriverId === authUid) &&
-      status === "accepted";
-    if (alreadyAcceptedBySelf) {
-      idempotent = true;
-      return current;
-    }
-
-    const reservedForThisDriver =
-      assignedDriverId.length > 0 &&
-      assignedDriverId === authUid &&
-      RESERVED_FOR_DRIVER_STATUSES.has(status);
-    if (reservedForThisDriver) {
-      if (assignmentExpiresAt > 0 && now >= assignmentExpiresAt) {
-        failureReason = "assignment_expired";
-        return;
-      }
-      if (expiresAt > 0 && now >= expiresAt) {
-        failureReason = "expired";
-        return;
-      }
-      console.log("ACCEPT_RIDE_COMMIT", {
-        rideId,
-        path: ridePath,
-        mode: "reserved_popup_confirm",
-        statusBefore: status,
-      });
-      return {
-        ...current,
-        driver_id: driverId,
-        accepted_driver_id: driverId,
-        matched_driver_id: driverId,
-        status: "accepted",
-        trip_state: "driver_accepted",
-        accepted_at: now,
-        updated_at: now,
-      };
-    }
-
-    if (!isUnassigned) {
-      failureReason = "driver_already_set";
-      return;
-    }
-
-    if (!ACCEPT_FROM_OPEN_POOL_STATUSES.has(status)) {
-      failureReason = "status_not_requesting";
-      return;
-    }
-
-    if (expiresAt > 0 && now >= expiresAt) {
-      failureReason = "expired";
-      return;
-    }
-
-    console.log("ACCEPT_RIDE_COMMIT", {
-      rideId,
-      path: ridePath,
-      mode: "open_pool",
-      statusBefore: status,
-    });
-    return {
-      ...current,
-      driver_id: driverId,
-      accepted_driver_id: driverId,
-      matched_driver_id: driverId,
-      status: "accepted",
-      trip_state: "driver_accepted",
-      accepted_at: now,
-      updated_at: now,
-    };
-  });
-
-  console.log("ACCEPT_RIDE_TX_RESULT", {
-    rideId,
-    path: ridePath,
-    committed: tx.committed,
-    idempotent,
-    failureReason: idempotent ? "none" : failureReason,
-  });
-
-  if (!tx.committed && !idempotent) {
-    return {
-      success: false,
-      reason: failureReason === "unknown" ? "not_available" : failureReason,
-    };
-  }
-
-  return {
-    success: true,
-    idempotent,
-    reason: idempotent ? "already_accepted" : "accepted",
-  };
-});
+exports.patchRideRequestMetadata = functions.https.onCall(async (data, context) =>
+  ride.patchRideRequestMetadata(data, context, db),
+);
 
 exports.verifyPayment = functions.https.onCall(async (data, context) => {
   const reference = String(data?.reference ?? "").trim();
@@ -399,7 +244,8 @@ exports.recordTripCompletion = functions.https.onCall(async (data, context) => {
   if (
     status !== "completed" &&
     status !== "trip_completed" &&
-    tripState !== "trip_completed"
+    tripState !== "trip_completed" &&
+    tripState !== "completed"
   ) {
     return { success: false, reason: "trip_not_completed" };
   }

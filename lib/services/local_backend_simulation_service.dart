@@ -127,7 +127,7 @@ class LocalBackendSimulationService {
     );
     final reason = TripStateMachine.invalidTransitionReason(
       fromCanonicalState: canonical,
-      toCanonicalState: TripLifecycleState.tripCompleted,
+      toCanonicalState: TripLifecycleState.completed,
     );
     if (reason != null) {
       return SimulatedApiResult(
