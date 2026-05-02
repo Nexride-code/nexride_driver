@@ -54,3 +54,6 @@ functions/.secret.local
 
 web/node_modules/
 web/dist/
+macos/Pods/
+ios/Pods/
+android/.gradle/
