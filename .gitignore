@@ -45,3 +45,9 @@ app.*.map.json
 /android/app/release
 ios/Pods/
 DerivedData/
+
+# Firebase Functions — local secrets / params (use `.env.example` as template)
+functions/.env
+functions/.env.*
+!functions/.env.example
+functions/.secret.local

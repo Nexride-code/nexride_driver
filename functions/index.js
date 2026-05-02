@@ -1,17 +1,18 @@
-const functions = require("firebase-functions");
+require("./params");
+const { onCall } = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
+const {
+  flutterwaveSecretKey,
+  REGION,
+  flutterwaveSecretForVerify,
+  platformFeeNgn,
+} = require("./params");
 
 admin.initializeApp();
 const db = admin.database();
 
-const NEXRIDE_PLATFORM_FEE_NGN = 350;
-
-function flutterwaveSecretKey() {
-  return (
-    process.env.FLUTTERWAVE_SECRET_KEY ||
-    functions.config()?.flutterwave?.secret_key ||
-    ""
-  ).trim();
+function callableContext(request) {
+  return { auth: request.auth };
 }
 
 function isAdminContext(context) {
@@ -32,7 +33,7 @@ async function verifyPaymentInternal(reference) {
   }
 
   const now = Date.now();
-  const secret = flutterwaveSecretKey();
+  const secret = flutterwaveSecretForVerify();
   if (!secret) {
     await txRef.update({
       verified: false,
@@ -160,177 +161,189 @@ async function createWalletTransactionInternal({
 
 const ride = require("./ride_callables");
 
-exports.createRideRequest = functions.https.onCall(async (data, context) =>
-  ride.createRideRequest(data, context, db),
+const rideCallOpts = { region: REGION };
+
+exports.createRideRequest = onCall(rideCallOpts, async (request) =>
+  ride.createRideRequest(request.data, callableContext(request), db),
 );
 
-exports.acceptRideRequest = functions.https.onCall(async (data, context) =>
-  ride.acceptRideRequest(data, context, db),
+exports.acceptRideRequest = onCall(rideCallOpts, async (request) =>
+  ride.acceptRideRequest(request.data, callableContext(request), db),
 );
 
 /** @deprecated Use acceptRideRequest — kept for older client builds */
 exports.acceptRide = exports.acceptRideRequest;
 
-exports.driverEnroute = functions.https.onCall(async (data, context) =>
-  ride.driverEnroute(data, context, db),
+exports.driverEnroute = onCall(rideCallOpts, async (request) =>
+  ride.driverEnroute(request.data, callableContext(request), db),
 );
 
-exports.driverArrived = functions.https.onCall(async (data, context) =>
-  ride.driverArrived(data, context, db),
+exports.driverArrived = onCall(rideCallOpts, async (request) =>
+  ride.driverArrived(request.data, callableContext(request), db),
 );
 
-exports.startTrip = functions.https.onCall(async (data, context) =>
-  ride.startTrip(data, context, db),
+exports.startTrip = onCall(rideCallOpts, async (request) =>
+  ride.startTrip(request.data, callableContext(request), db),
 );
 
-exports.completeTrip = functions.https.onCall(async (data, context) =>
-  ride.completeTrip(data, context, db),
+exports.completeTrip = onCall(rideCallOpts, async (request) =>
+  ride.completeTrip(request.data, callableContext(request), db),
 );
 
-exports.cancelRideRequest = functions.https.onCall(async (data, context) =>
-  ride.cancelRideRequest(data, context, db),
+exports.cancelRideRequest = onCall(rideCallOpts, async (request) =>
+  ride.cancelRideRequest(request.data, callableContext(request), db),
 );
 
-exports.expireRideRequest = functions.https.onCall(async (data, context) =>
-  ride.expireRideRequest(data, context, db),
+exports.expireRideRequest = onCall(rideCallOpts, async (request) =>
+  ride.expireRideRequest(request.data, callableContext(request), db),
 );
 
-exports.patchRideRequestMetadata = functions.https.onCall(async (data, context) =>
-  ride.patchRideRequestMetadata(data, context, db),
+exports.patchRideRequestMetadata = onCall(rideCallOpts, async (request) =>
+  ride.patchRideRequestMetadata(request.data, callableContext(request), db),
 );
 
-exports.verifyPayment = functions.https.onCall(async (data, context) => {
-  const reference = String(data?.reference ?? "").trim();
-  if (!context.auth) {
-    return { success: false, reason: "unauthorized" };
-  }
-  if (!reference) {
-    return { success: false, reason: "invalid_reference" };
-  }
-  return verifyPaymentInternal(reference);
-});
+exports.verifyPayment = onCall(
+  { region: REGION, secrets: [flutterwaveSecretKey] },
+  async (request) => {
+    const reference = String(request.data?.reference ?? "").trim();
+    if (!request.auth) {
+      return { success: false, reason: "unauthorized" };
+    }
+    if (!reference) {
+      return { success: false, reason: "invalid_reference" };
+    }
+    return verifyPaymentInternal(reference);
+  },
+);
 
-exports.createWalletTransaction = functions.https.onCall(async (data, context) => {
-  if (!context.auth || !isAdminContext(context)) {
+exports.createWalletTransaction = onCall(rideCallOpts, async (request) => {
+  const ctx = callableContext(request);
+  if (!ctx.auth || !isAdminContext(ctx)) {
     return { success: false, reason: "unauthorized" };
   }
   return createWalletTransactionInternal({
-    userId: data?.userId,
-    amount: data?.amount,
-    type: data?.type,
-    idempotencyKey: data?.idempotencyKey,
+    userId: request.data?.userId,
+    amount: request.data?.amount,
+    type: request.data?.type,
+    idempotencyKey: request.data?.idempotencyKey,
   });
 });
 
-exports.recordTripCompletion = functions.https.onCall(async (data, context) => {
-  if (!context.auth || !isAdminContext(context)) {
-    return { success: false, reason: "unauthorized" };
-  }
+exports.recordTripCompletion = onCall(
+  { region: REGION, secrets: [flutterwaveSecretKey] },
+  async (request) => {
+    const ctx = callableContext(request);
+    if (!ctx.auth || !isAdminContext(ctx)) {
+      return { success: false, reason: "unauthorized" };
+    }
 
-  const rideId = String(data?.rideId ?? "").trim();
-  if (!rideId) {
-    return { success: false, reason: "invalid_ride_id" };
-  }
+    const rideId = String(request.data?.rideId ?? "").trim();
+    if (!rideId) {
+      return { success: false, reason: "invalid_ride_id" };
+    }
 
-  const rideRef = db.ref(`ride_requests/${rideId}`);
-  const rideSnap = await rideRef.get();
-  const ride = rideSnap.val();
-  if (!ride || typeof ride !== "object") {
-    return { success: false, reason: "ride_missing" };
-  }
+    const feeNgn = platformFeeNgn();
 
-  const status = String(ride.status || "").toLowerCase();
-  const tripState = String(ride.trip_state || "").toLowerCase();
-  if (
-    status !== "completed" &&
-    status !== "trip_completed" &&
-    tripState !== "trip_completed" &&
-    tripState !== "completed"
-  ) {
-    return { success: false, reason: "trip_not_completed" };
-  }
+    const rideRef = db.ref(`ride_requests/${rideId}`);
+    const rideSnap = await rideRef.get();
+    const rideVal = rideSnap.val();
+    if (!rideVal || typeof rideVal !== "object") {
+      return { success: false, reason: "ride_missing" };
+    }
 
-  const paymentReference = String(
-    ride.customer_transaction_reference || ride.payment_reference || ""
-  ).trim();
-  if (!paymentReference) {
-    return { success: false, reason: "missing_payment_reference" };
-  }
+    const status = String(rideVal.status || "").toLowerCase();
+    const tripState = String(rideVal.trip_state || "").toLowerCase();
+    if (
+      status !== "completed" &&
+      status !== "trip_completed" &&
+      tripState !== "trip_completed" &&
+      tripState !== "completed"
+    ) {
+      return { success: false, reason: "trip_not_completed" };
+    }
 
-  const verification = await verifyPaymentInternal(paymentReference);
-  if (!verification.success) {
-    return { success: false, reason: verification.reason || "verification_failed" };
-  }
+    const paymentReference = String(
+      rideVal.customer_transaction_reference || rideVal.payment_reference || ""
+    ).trim();
+    if (!paymentReference) {
+      return { success: false, reason: "missing_payment_reference" };
+    }
 
-  const riderId = String(ride.rider_id || "").trim();
-  const driverId = String(ride.driver_id || "").trim();
-  if (!riderId || !driverId) {
-    return { success: false, reason: "missing_trip_participants" };
-  }
+    const verification = await verifyPaymentInternal(paymentReference);
+    if (!verification.success) {
+      return { success: false, reason: verification.reason || "verification_failed" };
+    }
 
-  const totalDeliveryFee = Number(
-    ride.total_delivery_fee_paid || ride.total_delivery_fee || verification.amount || 0
-  );
-  if (!Number.isFinite(totalDeliveryFee) || totalDeliveryFee <= NEXRIDE_PLATFORM_FEE_NGN) {
-    return { success: false, reason: "invalid_trip_amount" };
-  }
-  const driverEarning = totalDeliveryFee - NEXRIDE_PLATFORM_FEE_NGN;
-  const completionIdem = `trip_completion_${rideId}`;
+    const riderId = String(rideVal.rider_id || "").trim();
+    const driverId = String(rideVal.driver_id || "").trim();
+    if (!riderId || !driverId) {
+      return { success: false, reason: "missing_trip_participants" };
+    }
 
-  const riderDebit = await createWalletTransactionInternal({
-    userId: riderId,
-    amount: totalDeliveryFee,
-    type: "rider_payment_debit",
-    idempotencyKey: `${completionIdem}_rider_debit`,
-  });
-  if (!riderDebit.success) {
-    return { success: false, reason: riderDebit.reason || "rider_debit_failed" };
-  }
+    const totalDeliveryFee = Number(
+      rideVal.total_delivery_fee_paid || rideVal.total_delivery_fee || verification.amount || 0
+    );
+    if (!Number.isFinite(totalDeliveryFee) || totalDeliveryFee <= feeNgn) {
+      return { success: false, reason: "invalid_trip_amount" };
+    }
+    const driverEarning = totalDeliveryFee - feeNgn;
+    const completionIdem = `trip_completion_${rideId}`;
 
-  const platformFee = await createWalletTransactionInternal({
-    userId: "nexride_platform",
-    amount: NEXRIDE_PLATFORM_FEE_NGN,
-    type: "platform_fee_credit",
-    idempotencyKey: `${completionIdem}_platform_fee`,
-  });
-  if (!platformFee.success) {
-    return { success: false, reason: platformFee.reason || "platform_fee_failed" };
-  }
+    const riderDebit = await createWalletTransactionInternal({
+      userId: riderId,
+      amount: totalDeliveryFee,
+      type: "rider_payment_debit",
+      idempotencyKey: `${completionIdem}_rider_debit`,
+    });
+    if (!riderDebit.success) {
+      return { success: false, reason: riderDebit.reason || "rider_debit_failed" };
+    }
 
-  const driverCredit = await createWalletTransactionInternal({
-    userId: driverId,
-    amount: driverEarning,
-    type: "driver_earning_credit",
-    idempotencyKey: `${completionIdem}_driver_credit`,
-  });
-  if (!driverCredit.success) {
-    return { success: false, reason: driverCredit.reason || "driver_credit_failed" };
-  }
+    const platformFeeTx = await createWalletTransactionInternal({
+      userId: "nexride_platform",
+      amount: feeNgn,
+      type: "platform_fee_credit",
+      idempotencyKey: `${completionIdem}_platform_fee`,
+    });
+    if (!platformFeeTx.success) {
+      return { success: false, reason: platformFeeTx.reason || "platform_fee_failed" };
+    }
 
-  await rideRef.update({
-    payment_verified: true,
-    payment_verified_at: Date.now(),
-    payment_status: "verified",
-    wallet_credit_status: "credited",
-    platform_fee_ngn: NEXRIDE_PLATFORM_FEE_NGN,
-    rider_earning_credited: driverEarning,
-    updated_at: Date.now(),
-  });
+    const driverCredit = await createWalletTransactionInternal({
+      userId: driverId,
+      amount: driverEarning,
+      type: "driver_earning_credit",
+      idempotencyKey: `${completionIdem}_driver_credit`,
+    });
+    if (!driverCredit.success) {
+      return { success: false, reason: driverCredit.reason || "driver_credit_failed" };
+    }
 
-  await db.ref(`driver_earnings/${driverId}/${rideId}`).update({
-    rideId,
-    amount: driverEarning,
-    platformFee: NEXRIDE_PLATFORM_FEE_NGN,
-    grossAmount: totalDeliveryFee,
-    status: "credited",
-    created_at: Date.now(),
-    updated_at: Date.now(),
-  });
+    await rideRef.update({
+      payment_verified: true,
+      payment_verified_at: Date.now(),
+      payment_status: "verified",
+      wallet_credit_status: "credited",
+      platform_fee_ngn: feeNgn,
+      rider_earning_credited: driverEarning,
+      updated_at: Date.now(),
+    });
 
-  return {
-    success: true,
-    reason: "trip_completion_recorded",
-    driverEarning,
-    platformFee: NEXRIDE_PLATFORM_FEE_NGN,
-  };
-});
+    await db.ref(`driver_earnings/${driverId}/${rideId}`).update({
+      rideId,
+      amount: driverEarning,
+      platformFee: feeNgn,
+      grossAmount: totalDeliveryFee,
+      status: "credited",
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    });
+
+    return {
+      success: true,
+      reason: "trip_completion_recorded",
+      driverEarning,
+      platformFee: feeNgn,
+    };
+  },
+);

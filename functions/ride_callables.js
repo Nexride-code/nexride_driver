@@ -4,6 +4,7 @@
  */
 
 const admin = require("firebase-admin");
+const { platformFeeNgn } = require("./params");
 
 const TRIP_STATE = {
   searching: "searching",
@@ -106,11 +107,6 @@ function legacyUiStatusForTripState(tripState) {
     default:
       return "searching";
   }
-}
-
-function platformFeeNgn() {
-  const v = Number(process.env.NEXRIDE_PLATFORM_FEE_NGN || 350);
-  return Number.isFinite(v) && v > 0 ? v : 350;
 }
 
 function grossFareFromRide(ride) {
