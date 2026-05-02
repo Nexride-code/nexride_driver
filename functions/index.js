@@ -1,7 +1,7 @@
 require("./params");
 const { onCall, onRequest } = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
-const { verifyTransactionByReference } = require("./flutterwave_api");
+const { verifyFlutterwavePaymentStrict } = require("./flutterwave_api");
 const { createWalletTransactionInternal } = require("./wallet_core");
 const {
   flutterwaveSecretKey,
@@ -17,14 +17,13 @@ function callableContext(request) {
   return { auth: request.auth };
 }
 
-function isAdminContext(context) {
-  return context?.auth?.token?.admin === true;
-}
-
+const { isNexRideAdmin } = require("./admin_auth");
 const ride = require("./ride_callables");
 const paymentFlow = require("./payment_flow");
 const withdrawFlow = require("./withdraw_flow");
 const trackPublic = require("./track_public");
+const adminCallables = require("./admin_callables");
+const supportCallables = require("./support_callables");
 
 async function verifyPaymentInternal(reference) {
   const ref = String(reference || "").trim();
@@ -40,10 +39,43 @@ async function verifyPaymentInternal(reference) {
     };
   }
 
-  const v = await verifyTransactionByReference(ref);
-  const payKey = String(v.flwTransactionId || ref || "").trim();
   const rideId = String(existing.ride_id || "").trim();
   const riderId = String(existing.rider_id || "").trim();
+  const rideSnap = rideId ? await db.ref(`ride_requests/${rideId}`).get() : null;
+  const rideRow = rideSnap && rideSnap.val() && typeof rideSnap.val() === "object" ? rideSnap.val() : null;
+  const expectedTx = String(
+    rideRow
+      ? (rideRow.customer_transaction_reference ?? rideRow.payment_reference ?? ref)
+      : ref,
+  ).trim();
+  const expectCur = String(
+    rideRow?.currency ?? existing.currency ?? "NGN",
+  )
+    .trim()
+    .toUpperCase() || "NGN";
+  let minFare;
+  if (rideRow) {
+    const f = Number(rideRow.fare ?? rideRow.total_delivery_fee ?? 0);
+    if (Number.isFinite(f) && f > 0) minFare = f;
+  }
+  if (minFare == null) {
+    const a = Number(existing.amount ?? 0);
+    if (Number.isFinite(a) && a > 0) minFare = a;
+  }
+  const expect = {
+    expectedTxRef: expectedTx || undefined,
+    expectedCurrency: expectCur,
+  };
+  if (minFare != null && Number.isFinite(minFare)) {
+    expect.minAmount = minFare;
+  }
+
+  const v = await verifyFlutterwavePaymentStrict({
+    transactionId: /^\d+$/.test(ref) ? ref : "",
+    txRef: ref,
+    expect,
+  });
+  const payKey = String(v.flwTransactionId || ref || "").trim();
   await paymentFlow.mirrorPaymentRecords(db, {
     payKey,
     txRef: ref,
@@ -60,13 +92,38 @@ async function verifyPaymentInternal(reference) {
   if (!v.ok) {
     return { success: false, reason: v.reason || "verification_failed" };
   }
+  const driverId = rideRow ? String(rideRow.driver_id || "").trim() : "";
+  await paymentFlow.persistVerifiedFlutterwaveCharge(db, {
+    transactionId: payKey,
+    txRef: String(v.tx_ref || ref).trim(),
+    rideId: rideId || null,
+    riderId: riderId || null,
+    driverId: driverId || null,
+    amount: v.amount ?? 0,
+    currency: v.currency || expectCur,
+    rawStatus: String(v.payload?.data?.status ?? ""),
+    webhookBody: { event: "callable_verify_payment", data: v.payload?.data },
+  });
   if (rideId) {
     const ts = Date.now();
     await db.ref(`ride_requests/${rideId}`).update({
       payment_status: "verified",
       payment_verified_at: ts,
+      payment_provider: "flutterwave",
+      payment_transaction_id: payKey,
+      paid_at: ts,
       updated_at: ts,
     });
+    const activeSnap = await db.ref(`active_trips/${rideId}`).get();
+    if (activeSnap.exists()) {
+      await db.ref(`active_trips/${rideId}`).update({
+        payment_status: "verified",
+        payment_provider: "flutterwave",
+        payment_transaction_id: payKey,
+        paid_at: ts,
+        updated_at: ts,
+      });
+    }
     const freshSnap = await db.ref(`ride_requests/${rideId}`).get();
     await ride.fanOutDriverOffersIfEligible(db, rideId, freshSnap.val() || {});
     await trackPublic.syncRideTrackPublic(db, rideId);
@@ -124,6 +181,53 @@ exports.patchRideRequestMetadata = onCall(rideCallOpts, async (request) =>
   ride.patchRideRequestMetadata(request.data, callableContext(request), db),
 );
 
+/** Public tracking — `token` is `ride_requests.track_token` (share link). */
+exports.getRideTrackSummary = onCall(
+  { region: REGION, invoker: "public" },
+  async (request) => trackPublic.getRideTrackSummary(request.data, db),
+);
+
+exports.adminListLiveRides = onCall(rideCallOpts, async (request) =>
+  adminCallables.adminListLiveRides(request.data, callableContext(request), db),
+);
+exports.adminGetRideDetails = onCall(rideCallOpts, async (request) =>
+  adminCallables.adminGetRideDetails(request.data, callableContext(request), db),
+);
+exports.adminApproveWithdrawal = onCall(rideCallOpts, async (request) =>
+  adminCallables.adminApproveWithdrawal(request.data, callableContext(request), db),
+);
+exports.adminRejectWithdrawal = onCall(rideCallOpts, async (request) =>
+  adminCallables.adminRejectWithdrawal(request.data, callableContext(request), db),
+);
+exports.adminVerifyDriver = onCall(rideCallOpts, async (request) =>
+  adminCallables.adminVerifyDriver(request.data, callableContext(request), db),
+);
+exports.adminListPendingWithdrawals = onCall(rideCallOpts, async (request) =>
+  adminCallables.adminListPendingWithdrawals(request.data, callableContext(request), db),
+);
+exports.adminListPayments = onCall(rideCallOpts, async (request) =>
+  adminCallables.adminListPayments(request.data, callableContext(request), db),
+);
+exports.adminListDrivers = onCall(rideCallOpts, async (request) =>
+  adminCallables.adminListDrivers(request.data, callableContext(request), db),
+);
+exports.adminListRiders = onCall(rideCallOpts, async (request) =>
+  adminCallables.adminListRiders(request.data, callableContext(request), db),
+);
+
+exports.supportSearchRide = onCall(rideCallOpts, async (request) =>
+  supportCallables.supportSearchRide(request.data, callableContext(request), db),
+);
+exports.supportSearchUser = onCall(rideCallOpts, async (request) =>
+  supportCallables.supportSearchUser(request.data, callableContext(request), db),
+);
+exports.supportListTickets = onCall(rideCallOpts, async (request) =>
+  supportCallables.supportListTickets(request.data, callableContext(request), db),
+);
+exports.supportUpdateTicket = onCall(rideCallOpts, async (request) =>
+  supportCallables.supportUpdateTicket(request.data, callableContext(request), db),
+);
+
 exports.verifyPayment = onCall(
   { region: REGION, secrets: [flutterwaveSecretKey] },
   async (request) => {
@@ -176,7 +280,7 @@ exports.flutterwaveWebhook = onRequest(
 
 exports.createWalletTransaction = onCall(rideCallOpts, async (request) => {
   const ctx = callableContext(request);
-  if (!ctx.auth || !isAdminContext(ctx)) {
+  if (!ctx.auth || !(await isNexRideAdmin(db, ctx))) {
     return { success: false, reason: "unauthorized" };
   }
   return createWalletTransactionInternal(db, {
@@ -199,7 +303,7 @@ exports.recordTripCompletion = onCall(
   { region: REGION, secrets: [flutterwaveSecretKey] },
   async (request) => {
     const ctx = callableContext(request);
-    if (!ctx.auth || !isAdminContext(ctx)) {
+    if (!ctx.auth || !(await isNexRideAdmin(db, ctx))) {
       return { success: false, reason: "unauthorized" };
     }
 
@@ -294,6 +398,7 @@ exports.recordTripCompletion = onCall(
       rider_earning_credited: driverEarning,
       updated_at: Date.now(),
     });
+    await trackPublic.syncRideTrackPublic(db, rideId);
 
     await db.ref(`driver_earnings/${driverId}/${rideId}`).update({
       rideId,

@@ -53,8 +53,30 @@
         ".write": false
       }
     },
+    "ride_track_public": {
+      "$token": {
+        ".read": true,
+        ".write": false
+      }
+    },
+    "webhook_applied": {
+      "flutterwave": {
+        "$txId": {
+          ".read": false,
+          ".write": false
+        }
+      }
+    },
+    "driver_wallet_ledger": {
+      "$driverId": {
+        "$entry": {
+          ".read": "auth != null && auth.uid === $driverId",
+          ".write": false
+        }
+      }
+    },
     "ride_requests": {
-      ".indexOn": ["market_pool", "driver_id", "rider_id", "trip_state", "status", "created_at", "updated_at"],
+      ".indexOn": ["market_pool", "driver_id", "rider_id", "trip_state", "status", "created_at", "updated_at", "track_token"],
       "$rideId": {
         ".read": "auth != null && (data.child('rider_id').val() === auth.uid || data.child('driver_id').val() === auth.uid)",
         ".write": false
@@ -87,7 +109,7 @@
     },
     "payments": {
       "$transactionId": {
-        ".read": "auth != null && (!data.exists() || data.child('rider_id').val() === auth.uid || root.child('admins').child(auth.uid).val() === true)",
+        ".read": "auth != null && (!data.exists() || data.child('rider_id').val() === auth.uid || root.child('admins').child(auth.uid).val() === true || root.child('support_staff').child(auth.uid).val() === true)",
         ".write": false
       }
     },

@@ -6,6 +6,8 @@
 const admin = require("firebase-admin");
 const { platformFeeNgn } = require("./params");
 const { syncRideTrackPublic } = require("./track_public");
+const { isNexRideAdmin } = require("./admin_auth");
+const { createWalletTransactionInternal } = require("./wallet_core");
 
 const TRIP_STATE = {
   searching: "searching",
@@ -103,6 +105,15 @@ function paymentAllowsDispatch(ride) {
     return true;
   }
   return ps === "verified";
+}
+
+/** Card / Flutterwave flows require a verified charge id on the ride before completion. */
+function needsFlutterwavePaymentProof(ride) {
+  if (!ride || typeof ride !== "object") return false;
+  const pm = String(ride.payment_method ?? ride.paymentMethod ?? "cash")
+    .trim()
+    .toLowerCase();
+  return pm && pm !== "cash" && pm !== "bank_transfer";
 }
 
 const ACCEPTABLE_OPEN_STATUS = new Set([
@@ -704,7 +715,14 @@ async function completeTrip(data, context, db) {
       reason = "invalid_state";
       return;
     }
-    if (!paymentAllowsDispatch(cur)) {
+    if (needsFlutterwavePaymentProof(cur)) {
+      const ps = String(cur.payment_status ?? cur.paymentStatus ?? "").trim().toLowerCase();
+      const ptid = String(cur.payment_transaction_id ?? "").trim();
+      if (ps !== "verified" || !ptid) {
+        reason = "payment_not_verified";
+        return;
+      }
+    } else if (!paymentAllowsDispatch(cur)) {
       reason = "payment_not_verified";
       return;
     }
@@ -757,6 +775,53 @@ async function completeTrip(data, context, db) {
   });
   await writeAudit(db, { type: "ride_complete", ride_id: rideId, actor_uid: driverId });
   await syncRideTrackPublic(db, rideId);
+
+  if (needsFlutterwavePaymentProof(ride)) {
+    const gross = grossFareFromRide(ride);
+    const fee = platformFeeNgn();
+    const driverPayout = Math.max(0, gross - fee);
+    if (driverPayout > 0 && driverId) {
+      const ledgerRef = db.ref(`driver_wallet_ledger/${driverId}/${rideId}_fare_credit`);
+      const ltxn = await ledgerRef.transaction((cur) => {
+        if (cur && typeof cur === "object" && cur.completed) {
+          return undefined;
+        }
+        if (cur && typeof cur === "object" && cur.pending) {
+          return cur;
+        }
+        if (cur != null && cur !== undefined) {
+          return undefined;
+        }
+        return { pending: true, at: nowMs() };
+      });
+      if (!ltxn.committed) {
+        console.log("WALLET_CREDIT_DUPLICATE_IGNORED", rideId);
+      } else {
+        const wt = await createWalletTransactionInternal(db, {
+          userId: driverId,
+          amount: driverPayout,
+          type: "driver_earning_credit",
+          idempotencyKey: `${rideId}_fare_credit`,
+        });
+        if (wt.success) {
+          await ledgerRef.update({
+            completed: true,
+            amount: driverPayout,
+            credited_at: nowMs(),
+            source: "complete_trip",
+          });
+          console.log("WALLET_CREDITED", driverId, rideId);
+        } else {
+          try {
+            await ledgerRef.remove();
+          } catch (_) {
+            /* ignore */
+          }
+        }
+      }
+    }
+  }
+
   return { success: true, reason: "completed" };
 }
 
@@ -767,6 +832,10 @@ async function cancelRideRequest(data, context, db) {
     return { success: false, reason: "unauthorized" };
   }
   const uid = normUid(context.auth.uid);
+  let isAdminUser = context.auth?.token?.admin === true;
+  if (!isAdminUser) {
+    isAdminUser = await isNexRideAdmin(db, context);
+  }
   const rideRef = db.ref(`ride_requests/${rideId}`);
   let reason = "unknown";
   const tx = await rideRef.transaction((cur) => {
@@ -778,7 +847,7 @@ async function cancelRideRequest(data, context, db) {
     const driver = normUid(cur.driver_id);
     const isRider = uid === rider;
     const isDriver = uid === driver && !isPlaceholderDriverId(cur.driver_id);
-    const isAdmin = context.auth?.token?.admin === true;
+    const isAdmin = isAdminUser;
     if (!isRider && !isDriver && !isAdmin) {
       reason = "forbidden";
       return;
