@@ -2,6 +2,7 @@ require("./params");
 const { onCall, onRequest } = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
 const { verifyTransactionByReference } = require("./flutterwave_api");
+const { createWalletTransactionInternal } = require("./wallet_core");
 const {
   flutterwaveSecretKey,
   flutterwaveWebhookSecret,
@@ -20,8 +21,13 @@ function isAdminContext(context) {
   return context?.auth?.token?.admin === true;
 }
 
+const ride = require("./ride_callables");
+const paymentFlow = require("./payment_flow");
+const withdrawFlow = require("./withdraw_flow");
+
 async function verifyPaymentInternal(reference) {
-  const txRef = db.ref(`payment_transactions/${reference}`);
+  const ref = String(reference || "").trim();
+  const txRef = db.ref(`payment_transactions/${ref}`);
   const existingSnap = await txRef.get();
   const existing = existingSnap.val() || {};
   if (existing.verified === true) {
@@ -33,91 +39,44 @@ async function verifyPaymentInternal(reference) {
     };
   }
 
-  const now = Date.now();
-  const v = await verifyTransactionByReference(reference);
-  await txRef.update({
+  const v = await verifyTransactionByReference(ref);
+  const payKey = String(v.flwTransactionId || ref || "").trim();
+  const rideId = String(existing.ride_id || "").trim();
+  const riderId = String(existing.rider_id || "").trim();
+  await paymentFlow.mirrorPaymentRecords(db, {
+    payKey,
+    txRef: ref,
+    rideId: rideId || null,
+    riderId: riderId || null,
     verified: v.ok,
-    provider_status: v.providerStatus || "unknown",
     amount: v.amount ?? 0,
-    provider_payload: v.payload || {},
-    verification_error: v.ok ? null : v.reason || "failed",
-    verified_at: now,
-    updated_at: now,
+    providerStatus: v.providerStatus || "unknown",
+    payload: v.payload || {},
+    webhookEvent: "callable_verify_payment",
+    webhookApplied: false,
   });
 
   if (!v.ok) {
     return { success: false, reason: v.reason || "verification_failed" };
+  }
+  if (rideId) {
+    const ts = Date.now();
+    await db.ref(`ride_requests/${rideId}`).update({
+      payment_status: "verified",
+      payment_verified_at: ts,
+      updated_at: ts,
+    });
+    const freshSnap = await db.ref(`ride_requests/${rideId}`).get();
+    await ride.fanOutDriverOffersIfEligible(db, rideId, freshSnap.val() || {});
   }
   return {
     success: true,
     reason: "verified",
     amount: v.amount,
     providerStatus: v.providerStatus,
+    transaction_id: payKey,
   };
 }
-
-async function createWalletTransactionInternal({
-  userId,
-  amount,
-  type,
-  idempotencyKey,
-}) {
-  const normalizedUserId = String(userId || "").trim();
-  const numericAmount = Number(amount || 0);
-  const normalizedType = String(type || "").trim();
-  const idem = String(idempotencyKey || "").trim();
-  if (!normalizedUserId || !normalizedType || !Number.isFinite(numericAmount) || numericAmount <= 0) {
-    return { success: false, reason: "invalid_input" };
-  }
-
-  const walletRef = db.ref(`wallets/${normalizedUserId}`);
-  const transactionId = idem || db.ref("wallet_transactions").push().key;
-  let failureReason = "unknown";
-
-  const tx = await walletRef.transaction((current) => {
-    const wallet = current && typeof current === "object" ? current : {};
-    const balance = Number(wallet.balance || 0);
-    const transactions =
-      wallet.transactions && typeof wallet.transactions === "object"
-        ? wallet.transactions
-        : {};
-    if (transactionId && transactions[transactionId]) {
-      return wallet;
-    }
-
-    const isDebit = normalizedType === "rider_payment_debit" || normalizedType === "platform_fee_debit";
-    const nextBalance = isDebit ? balance - numericAmount : balance + numericAmount;
-    if (isDebit && nextBalance < 0) {
-      failureReason = "insufficient_balance";
-      return;
-    }
-
-    return {
-      ...wallet,
-      user_id: normalizedUserId,
-      balance: nextBalance,
-      updated_at: Date.now(),
-      transactions: {
-        ...transactions,
-        [transactionId]: {
-          transactionId,
-          type: normalizedType,
-          amount: numericAmount,
-          direction: isDebit ? "debit" : "credit",
-          created_at: Date.now(),
-        },
-      },
-    };
-  });
-
-  if (!tx.committed) {
-    return { success: false, reason: failureReason === "unknown" ? "wallet_update_failed" : failureReason };
-  }
-  return { success: true, reason: "wallet_updated", transactionId };
-}
-
-const ride = require("./ride_callables");
-const paymentFlow = require("./payment_flow");
 
 const rideCallOpts = { region: REGION };
 
@@ -166,7 +125,13 @@ exports.patchRideRequestMetadata = onCall(rideCallOpts, async (request) =>
 exports.verifyPayment = onCall(
   { region: REGION, secrets: [flutterwaveSecretKey] },
   async (request) => {
-    const reference = String(request.data?.reference ?? "").trim();
+    const reference = String(
+      request.data?.reference ??
+        request.data?.tx_ref ??
+        request.data?.transactionId ??
+        request.data?.transaction_id ??
+        "",
+    ).trim();
     if (!request.auth) {
       return { success: false, reason: "unauthorized" };
     }
@@ -200,7 +165,7 @@ exports.verifyFlutterwavePayment = onCall(
 exports.flutterwaveWebhook = onRequest(
   {
     region: REGION,
-    secrets: [flutterwaveWebhookSecret],
+    secrets: [flutterwaveWebhookSecret, flutterwaveSecretKey],
     cors: true,
     invoker: "public",
   },
@@ -212,13 +177,21 @@ exports.createWalletTransaction = onCall(rideCallOpts, async (request) => {
   if (!ctx.auth || !isAdminContext(ctx)) {
     return { success: false, reason: "unauthorized" };
   }
-  return createWalletTransactionInternal({
+  return createWalletTransactionInternal(db, {
     userId: request.data?.userId,
     amount: request.data?.amount,
     type: request.data?.type,
     idempotencyKey: request.data?.idempotencyKey,
   });
 });
+
+exports.requestWithdrawal = onCall(rideCallOpts, async (request) =>
+  withdrawFlow.requestWithdrawal(request.data, callableContext(request), db),
+);
+
+exports.approveWithdrawal = onCall(rideCallOpts, async (request) =>
+  withdrawFlow.approveWithdrawal(request.data, callableContext(request), db),
+);
 
 exports.recordTripCompletion = onCall(
   { region: REGION, secrets: [flutterwaveSecretKey] },
@@ -280,7 +253,7 @@ exports.recordTripCompletion = onCall(
     const driverEarning = totalDeliveryFee - feeNgn;
     const completionIdem = `trip_completion_${rideId}`;
 
-    const riderDebit = await createWalletTransactionInternal({
+    const riderDebit = await createWalletTransactionInternal(db, {
       userId: riderId,
       amount: totalDeliveryFee,
       type: "rider_payment_debit",
@@ -290,7 +263,7 @@ exports.recordTripCompletion = onCall(
       return { success: false, reason: riderDebit.reason || "rider_debit_failed" };
     }
 
-    const platformFeeTx = await createWalletTransactionInternal({
+    const platformFeeTx = await createWalletTransactionInternal(db, {
       userId: "nexride_platform",
       amount: feeNgn,
       type: "platform_fee_credit",
@@ -300,7 +273,7 @@ exports.recordTripCompletion = onCall(
       return { success: false, reason: platformFeeTx.reason || "platform_fee_failed" };
     }
 
-    const driverCredit = await createWalletTransactionInternal({
+    const driverCredit = await createWalletTransactionInternal(db, {
       userId: driverId,
       amount: driverEarning,
       type: "driver_earning_credit",

@@ -292,8 +292,7 @@ async function createRideRequest(data, context, db) {
   const paymentMethod = String(data?.payment_method ?? data?.paymentMethod ?? "cash")
     .trim()
     .toLowerCase();
-  const cashLike = paymentMethod === "cash" || paymentMethod === "bank_transfer";
-  const paymentStatus = cashLike ? "verified" : "pending";
+  const paymentStatus = "pending";
 
   const distanceKm = Number(data?.distance_km ?? data?.distanceKm ?? 0) || 0;
   const etaMin = Number(data?.eta_min ?? data?.etaMin ?? 0) || 0;
@@ -690,6 +689,10 @@ async function completeTrip(data, context, db) {
       reason = "invalid_state";
       return;
     }
+    if (!paymentAllowsDispatch(cur)) {
+      reason = "payment_not_verified";
+      return;
+    }
     const now = nowMs();
     const gross = grossFareFromRide(cur);
     const fee = platformFeeNgn();
@@ -759,7 +762,8 @@ async function cancelRideRequest(data, context, db) {
     const driver = normUid(cur.driver_id);
     const isRider = uid === rider;
     const isDriver = uid === driver && !isPlaceholderDriverId(cur.driver_id);
-    if (!isRider && !isDriver) {
+    const isAdmin = context.auth?.token?.admin === true;
+    if (!isRider && !isDriver && !isAdmin) {
       reason = "forbidden";
       return;
     }
@@ -782,9 +786,10 @@ async function cancelRideRequest(data, context, db) {
       cancelled_at: now,
       updated_at: now,
       cancel_reason:
-        cancelReason || (isRider ? "rider_cancelled" : "driver_cancelled"),
-      cancel_actor: isRider ? "rider" : "driver",
-      cancelled_by: isRider ? "rider" : "driver",
+        cancelReason ||
+        (isAdmin ? "admin_cancelled" : isRider ? "rider_cancelled" : "driver_cancelled"),
+      cancel_actor: isAdmin ? "admin" : isRider ? "rider" : "driver",
+      cancelled_by: isAdmin ? "admin" : isRider ? "rider" : "driver",
     };
   });
   if (!tx.committed) {

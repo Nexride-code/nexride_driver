@@ -51,3 +51,6 @@ functions/.env
 functions/.env.*
 !functions/.env.example
 functions/.secret.local
+
+web/node_modules/
+web/dist/

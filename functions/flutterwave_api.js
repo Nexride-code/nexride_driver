@@ -4,9 +4,17 @@
 
 const { flutterwaveSecretForVerify } = require("./params");
 
+function flutterwaveVerifyUrl(refOrNumericId) {
+  const s = String(refOrNumericId || "").trim();
+  if (/^\d+$/.test(s)) {
+    return `https://api.flutterwave.com/v3/transactions/${encodeURIComponent(s)}/verify`;
+  }
+  return `https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref=${encodeURIComponent(s)}`;
+}
+
 /**
- * @param {string} reference tx_ref or Flutterwave transaction id
- * @returns {Promise<{ ok: boolean, reason?: string, amount?: number, providerStatus?: string, payload?: object }>}
+ * @param {string} reference tx_ref or Flutterwave numeric transaction id
+ * @returns {Promise<{ ok: boolean, reason?: string, amount?: number, providerStatus?: string, payload?: object, flwTransactionId?: string }>}
  */
 async function verifyTransactionByReference(reference) {
   const ref = String(reference || "").trim();
@@ -19,16 +27,13 @@ async function verifyTransactionByReference(reference) {
   }
   let response;
   try {
-    response = await fetch(
-      `https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref=${encodeURIComponent(ref)}`,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${secret}`,
-          "Content-Type": "application/json",
-        },
+    response = await fetch(flutterwaveVerifyUrl(ref), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        "Content-Type": "application/json",
       },
-    );
+    });
   } catch (error) {
     return { ok: false, reason: "network_error", payload: { error: String(error) } };
   }
@@ -42,12 +47,14 @@ async function verifyTransactionByReference(reference) {
   const dataStatus = String(payload?.data?.status || "").toLowerCase();
   const amount = Number(payload?.data?.amount || 0);
   const ok = response.ok && providerStatus === "success" && dataStatus === "successful";
+  const flwTransactionId = String(payload?.data?.id ?? "").trim() || null;
   return {
     ok,
     reason: ok ? undefined : "verification_failed",
     amount,
     providerStatus: dataStatus || providerStatus,
     payload,
+    flwTransactionId,
   };
 }
 

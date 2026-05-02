@@ -1,5 +1,7 @@
 /**
  * Rider-facing payment initiation + verification (Flutterwave).
+ * Canonical charge rows: payments/{flutterwaveTransactionId|tx_ref}
+ * Legacy mirror: payment_transactions/{tx_ref}
  */
 
 const { verifyTransactionByReference, createHostedPaymentLink } = require("./flutterwave_api");
@@ -11,6 +13,59 @@ function normUid(uid) {
 
 function nowMs() {
   return Date.now();
+}
+
+/**
+ * Upsert `payments/{payKey}` and mirror legacy `payment_transactions/{txRef}`.
+ * @param {string} payKey Flutterwave transaction id preferred, else tx_ref
+ */
+async function mirrorPaymentRecords(db, {
+  payKey,
+  txRef,
+  rideId,
+  riderId,
+  verified,
+  amount,
+  providerStatus,
+  payload,
+  webhookEvent,
+  webhookApplied,
+}) {
+  const key = String(payKey || "").trim();
+  const ref = String(txRef || "").trim() || key;
+  if (!key) {
+    return;
+  }
+  const now = nowMs();
+  const row = {
+    transaction_id: key,
+    tx_ref: ref || null,
+    ride_id: rideId || null,
+    rider_id: riderId || null,
+    verified: !!verified,
+    amount: Number(amount || 0) || 0,
+    provider_status: providerStatus || "unknown",
+    updated_at: now,
+  };
+  if (webhookEvent) {
+    row.webhook_event = webhookEvent;
+  }
+  if (typeof webhookApplied === "boolean") {
+    row.webhook_applied = webhookApplied;
+  }
+  if (payload && typeof payload === "object") {
+    row.provider_payload = payload;
+  }
+  const updates = {
+    [`payments/${key}`]: row,
+  };
+  if (ref) {
+    updates[`payment_transactions/${ref}`] = {
+      ...row,
+      tx_ref: ref,
+    };
+  }
+  await db.ref().update(updates);
 }
 
 async function initiateFlutterwavePayment(data, context, db) {
@@ -67,6 +122,7 @@ async function initiateFlutterwavePayment(data, context, db) {
     currency,
     status: "pending",
     provider_link: r.link,
+    verified: false,
     created_at: now,
     updated_at: now,
   });
@@ -89,7 +145,7 @@ async function verifyFlutterwavePayment(data, context, db) {
     return { success: false, reason: "unauthorized" };
   }
   const rideId = normUid(data?.rideId ?? data?.ride_id);
-  const reference = String(data?.reference ?? data?.tx_ref ?? "").trim();
+  const reference = String(data?.reference ?? data?.tx_ref ?? data?.transactionId ?? data?.transaction_id ?? "").trim();
   if (!rideId || !reference) {
     return { success: false, reason: "invalid_input" };
   }
@@ -100,14 +156,18 @@ async function verifyFlutterwavePayment(data, context, db) {
   }
   const v = await verifyTransactionByReference(reference);
   const now = nowMs();
-  await db.ref(`payment_transactions/${reference}`).update({
+  const payKey = String(v.flwTransactionId || reference || "").trim();
+  await mirrorPaymentRecords(db, {
+    payKey,
+    txRef: reference,
+    rideId,
+    riderId: normUid(ride.rider_id),
     verified: v.ok,
-    provider_status: v.providerStatus || "unknown",
     amount: v.amount ?? 0,
-    verified_at: now,
-    updated_at: now,
-    ride_id: rideId,
-    rider_id: normUid(ride.rider_id),
+    providerStatus: v.providerStatus || "unknown",
+    payload: v.payload,
+    webhookEvent: "callable_verify",
+    webhookApplied: false,
   });
   if (!v.ok) {
     await db.ref(`ride_requests/${rideId}`).update({
@@ -123,13 +183,12 @@ async function verifyFlutterwavePayment(data, context, db) {
   });
   const fresh = (await db.ref(`ride_requests/${rideId}`).get()).val();
   await fanOutDriverOffersIfEligible(db, rideId, fresh || ride);
-  return { success: true, reason: "verified", amount: v.amount };
+  return { success: true, reason: "verified", amount: v.amount, transaction_id: payKey };
 }
 
 /**
  * Flutterwave charge webhook — verify `verif-hash` header.
- * @param {import("firebase-functions").https.Request} req
- * @param {import("firebase-functions").https.Response} res
+ * Idempotent: repeated delivery must not re-apply ride updates / fan-out side effects.
  */
 async function handleFlutterwaveWebhook(req, res, db) {
   const expected = String(process.env.FLUTTERWAVE_WEBHOOK_SECRET || "").trim();
@@ -138,6 +197,7 @@ async function handleFlutterwaveWebhook(req, res, db) {
     res.status(401).send("invalid signature");
     return;
   }
+
   let body = req.body;
   if (typeof body === "string") {
     try {
@@ -146,35 +206,77 @@ async function handleFlutterwaveWebhook(req, res, db) {
       body = {};
     }
   }
+
   const event = String(body?.event ?? "").trim().toLowerCase();
   const data = body?.data && typeof body.data === "object" ? body.data : {};
   const txRef = String(data?.tx_ref ?? data?.txRef ?? "").trim();
-  if (!txRef) {
+  const flwTxId = String(data?.id ?? "").trim();
+  const payKey = flwTxId || txRef;
+
+  if (!payKey) {
+    res.status(200).send("ignored-no-id");
+    return;
+  }
+
+  const paySnap = await db.ref(`payments/${payKey}`).get();
+  const prev = paySnap.val() || {};
+  if (prev.webhook_applied === true && prev.verified === true) {
+    res.status(200).send("ok-idempotent");
+    return;
+  }
+
+  const verifyKey = flwTxId || txRef;
+  if (!verifyKey) {
     res.status(200).send("ignored");
     return;
   }
-  const v = await verifyTransactionByReference(txRef);
+
+  const v = await verifyTransactionByReference(verifyKey);
   const now = nowMs();
-  await db.ref(`payment_transactions/${txRef}`).update({
+
+  const meta = data?.meta && typeof data.meta === "object" ? data.meta : {};
+  const metaRide = String(meta?.ride_id ?? meta?.rideId ?? "").trim();
+  const rideId =
+    metaRide ||
+    String(prev.ride_id || (await db.ref(`payment_transactions/${txRef}/ride_id`).get()).val() || "").trim();
+
+  const riderId =
+    String(meta?.rider_id ?? meta?.riderId ?? prev.rider_id ?? "").trim() ||
+    String((await db.ref(`payment_transactions/${txRef}/rider_id`).get()).val() ?? "").trim();
+
+  await mirrorPaymentRecords(db, {
+    payKey,
+    txRef: txRef || verifyKey,
+    rideId: rideId || null,
+    riderId: riderId || null,
     verified: v.ok,
-    provider_status: v.providerStatus || "unknown",
     amount: v.amount ?? 0,
-    verified_at: now,
-    updated_at: now,
-    webhook_event: event,
-    webhook_payload: body,
+    providerStatus: v.providerStatus || "unknown",
+    payload: body,
+    webhookEvent: event || "webhook",
+    webhookApplied: !!(v.ok && (event === "charge.completed" || !event)),
   });
-  const metaRide = String(data?.meta?.ride_id ?? data?.meta?.rideId ?? "").trim();
-  const rideId = metaRide || String((await db.ref(`payment_transactions/${txRef}/ride_id`).get()).val() ?? "").trim();
-  if (rideId && v.ok) {
+
+  if (v.ok && rideId) {
     await db.ref(`ride_requests/${rideId}`).update({
       payment_status: "verified",
       payment_verified_at: now,
       updated_at: now,
     });
+    await db.ref(`payments/${payKey}`).update({
+      webhook_applied: true,
+      updated_at: now,
+    });
+    if (tx_ref && flwTxId && tx_ref !== flwTxId) {
+      await db.ref(`payment_transactions/${tx_ref}`).update({
+        flutterwave_transaction_id: flwTxId,
+        updated_at: now,
+      });
+    }
     const fresh = (await db.ref(`ride_requests/${rideId}`).get()).val();
     await fanOutDriverOffersIfEligible(db, rideId, fresh || {});
   }
+
   res.status(200).send("ok");
 }
 
@@ -182,4 +284,5 @@ module.exports = {
   initiateFlutterwavePayment,
   verifyFlutterwavePayment,
   handleFlutterwaveWebhook,
+  mirrorPaymentRecords,
 };
