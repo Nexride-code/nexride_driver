@@ -5,6 +5,7 @@
 
 const admin = require("firebase-admin");
 const { platformFeeNgn } = require("./params");
+const { syncRideTrackPublic } = require("./track_public");
 
 const TRIP_STATE = {
   searching: "searching",
@@ -306,11 +307,17 @@ async function createRideRequest(data, context, db) {
     return { success: false, reason: "ride_id_alloc_failed" };
   }
 
+  const trackToken = normUid(db.ref().push().key);
+  if (!trackToken) {
+    return { success: false, reason: "track_token_alloc_failed" };
+  }
+
   const ts = nowMs();
   const payload = {
     ride_id: rideId,
     rider_id: riderId,
     driver_id: null,
+    track_token: trackToken,
     market,
     market_pool: market,
     status: "searching",
@@ -402,7 +409,9 @@ async function createRideRequest(data, context, db) {
     actor_uid: riderId,
   });
 
-  return { success: true, rideId, reason: "created" };
+  await syncRideTrackPublic(db, rideId);
+
+  return { success: true, rideId, trackToken, reason: "created" };
 }
 
 async function acceptRideRequest(data, context, db) {
@@ -431,6 +440,7 @@ async function acceptRideRequest(data, context, db) {
       preTrip === "driver_accepted" ||
       preStatus === "accepted");
   if (alreadyMine) {
+    await syncRideTrackPublic(db, rideId);
     return { success: true, idempotent: true, reason: "already_accepted" };
   }
 
@@ -525,6 +535,8 @@ async function acceptRideRequest(data, context, db) {
     actor_uid: driverId,
   });
 
+  await syncRideTrackPublic(db, rideId);
+
   return {
     success: true,
     idempotent: false,
@@ -574,6 +586,7 @@ async function driverEnroute(data, context, db) {
     return { success: false, reason };
   }
   await writeAudit(db, { type: "ride_enroute", ride_id: rideId, actor_uid: driverId });
+  await syncRideTrackPublic(db, rideId);
   return { success: true, reason: "enroute" };
 }
 
@@ -615,6 +628,7 @@ async function driverArrived(data, context, db) {
     return { success: false, reason };
   }
   await writeAudit(db, { type: "ride_arrived_pickup", ride_id: rideId, actor_uid: driverId });
+  await syncRideTrackPublic(db, rideId);
   return { success: true, reason: "arrived" };
 }
 
@@ -661,6 +675,7 @@ async function startTrip(data, context, db) {
     return { success: false, reason };
   }
   await writeAudit(db, { type: "ride_start", ride_id: rideId, actor_uid: driverId });
+  await syncRideTrackPublic(db, rideId);
   return { success: true, reason: "started" };
 }
 
@@ -741,6 +756,7 @@ async function completeTrip(data, context, db) {
     settlement: ride?.settlement ?? {},
   });
   await writeAudit(db, { type: "ride_complete", ride_id: rideId, actor_uid: driverId });
+  await syncRideTrackPublic(db, rideId);
   return { success: true, reason: "completed" };
 }
 
@@ -811,6 +827,7 @@ async function cancelRideRequest(data, context, db) {
     actor_uid: uid,
     cancel_reason: cancelReason,
   });
+  await syncRideTrackPublic(db, rideId);
   return { success: true, reason: "cancelled" };
 }
 
@@ -859,6 +876,7 @@ async function expireRideRequest(data, context, db) {
     await db.ref(`rider_active_ride/${uid}`).remove();
   }
   await writeAudit(db, { type: "ride_expire", ride_id: rideId, actor_uid: uid });
+  await syncRideTrackPublic(db, rideId);
   return { success: true, reason: "expired" };
 }
 
@@ -934,6 +952,7 @@ async function patchRideRequestMetadata(data, context, db) {
     actor_uid: uid,
     keys: Object.keys(patch).join(","),
   });
+  await syncRideTrackPublic(db, rideId);
   return { success: true, reason: "patched" };
 }
 

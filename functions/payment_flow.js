@@ -6,6 +6,7 @@
 
 const { verifyTransactionByReference, createHostedPaymentLink } = require("./flutterwave_api");
 const { fanOutDriverOffersIfEligible } = require("./ride_callables");
+const { syncRideTrackPublic } = require("./track_public");
 
 function normUid(uid) {
   return String(uid ?? "").trim();
@@ -132,6 +133,7 @@ async function initiateFlutterwavePayment(data, context, db) {
     payment_status: "pending",
     updated_at: now,
   });
+  await syncRideTrackPublic(db, rideId);
   return {
     success: true,
     tx_ref,
@@ -174,6 +176,7 @@ async function verifyFlutterwavePayment(data, context, db) {
       payment_status: "failed",
       updated_at: now,
     });
+    await syncRideTrackPublic(db, rideId);
     return { success: false, reason: v.reason || "verification_failed" };
   }
   await db.ref(`ride_requests/${rideId}`).update({
@@ -183,6 +186,7 @@ async function verifyFlutterwavePayment(data, context, db) {
   });
   const fresh = (await db.ref(`ride_requests/${rideId}`).get()).val();
   await fanOutDriverOffersIfEligible(db, rideId, fresh || ride);
+  await syncRideTrackPublic(db, rideId);
   return { success: true, reason: "verified", amount: v.amount, transaction_id: payKey };
 }
 
@@ -275,6 +279,7 @@ async function handleFlutterwaveWebhook(req, res, db) {
     }
     const fresh = (await db.ref(`ride_requests/${rideId}`).get()).val();
     await fanOutDriverOffersIfEligible(db, rideId, fresh || {});
+    await syncRideTrackPublic(db, rideId);
   }
 
   res.status(200).send("ok");

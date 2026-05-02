@@ -24,6 +24,7 @@ function isAdminContext(context) {
 const ride = require("./ride_callables");
 const paymentFlow = require("./payment_flow");
 const withdrawFlow = require("./withdraw_flow");
+const trackPublic = require("./track_public");
 
 async function verifyPaymentInternal(reference) {
   const ref = String(reference || "").trim();
@@ -68,6 +69,7 @@ async function verifyPaymentInternal(reference) {
     });
     const freshSnap = await db.ref(`ride_requests/${rideId}`).get();
     await ride.fanOutDriverOffersIfEligible(db, rideId, freshSnap.val() || {});
+    await trackPublic.syncRideTrackPublic(db, rideId);
   }
   return {
     success: true,
