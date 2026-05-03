@@ -319,6 +319,8 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   final Map<String, Map<String, dynamic>> _driverOfferRideCache =
       <String, Map<String, dynamic>>{};
   final Set<String> _loggedDriverOfferReceivedRideIds = <String>{};
+  /// One-shot RTDB read of `driver_offer_queue/{uid}` after go-online (debug).
+  bool _driverOfferQueuePostOnlineProbeDone = false;
   int _rideRequestListenerToken = 0;
 
   /// Serializes discovery attach/cancel so two callers cannot overlap native query setup.
@@ -7559,6 +7561,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _loggedDriverOfferReceivedRideIds.clear();
     _rideRequestPopupQueue.clear();
     _onlineSessionStartedAt = 0;
+    _driverOfferQueuePostOnlineProbeDone = false;
 
     _logRtdb('hard reset before listener attach');
   }
@@ -8532,7 +8535,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     var publishedPresence = false;
     _log(
         'goOnline requested ts=${DateTime.now().toIso8601String()} auth=${FirebaseAuth.instance.currentUser?.uid ?? 'none'} driverId=$driverId');
-    print('DRIVER_ONLINE_START');
+    debugPrint(
+      'DRIVER_ONLINE_START driverId=$driverId '
+      'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'}',
+    );
 
     Future<Map<String, dynamic>>? profileReconcileFuture;
     var onlinePublishAttempted = false;
@@ -8851,7 +8857,17 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
       // Await first market prime inside [_listenForRideRequests] so [driver_active_ride]
       // cannot populate [_driverActiveRideId] before the initial open-pool snapshot runs.
-      final discoveryReady = await _listenForRideRequests(reason: 'goOnline');
+      var discoveryReady = await _listenForRideRequests(reason: 'goOnline');
+      if (!discoveryReady) {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        discoveryReady = await _listenForRideRequests(reason: 'goOnline_retry');
+      }
+      debugPrint(
+        'DRIVER_ONLINE_SUCCESS driverId=$driverId '
+        'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'} '
+        'discoveryReady=$discoveryReady socket=$_socketStatus',
+      );
+      unawaited(_runDriverOfferQueueOnlineProbeOnce());
       _logDiscoveryChain(
         'go_online listener_attach_succeeded=$discoveryReady '
         'query_market=${_effectiveDriverMarket ?? 'null'}',
@@ -9499,6 +9515,46 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     });
     await _rideDiscoveryAttachChain;
     return captured[0];
+  }
+
+  /// Single debug read of the driver's offer queue after GO ONLINE (rules / path sanity).
+  Future<void> _runDriverOfferQueueOnlineProbeOnce() async {
+    if (_driverOfferQueuePostOnlineProbeDone || !_isOnline || _isDisposing) {
+      return;
+    }
+    _driverOfferQueuePostOnlineProbeDone = true;
+    final authUid = FirebaseAuth.instance.currentUser?.uid.trim();
+    if (authUid == null || authUid.isEmpty) {
+      debugPrint(
+        'DRIVER_OFFER_QUEUE_ONLINE_PROBE_SKIP reason=no_auth_uid',
+      );
+      return;
+    }
+    final path = 'driver_offer_queue/$authUid';
+    try {
+      final snap = await rtdb.FirebaseDatabase.instance.ref(path).get();
+      final map = _asStringDynamicMap(snap.value);
+      debugPrint(
+        'DRIVER_OFFER_QUEUE_ONLINE_PROBE path=$path authUid=$authUid '
+        'exists=${snap.exists} childCount=${map?.length ?? 0}',
+      );
+    } catch (e, st) {
+      final denied = isRealtimeDatabasePermissionDenied(e);
+      debugPrint(
+        'DRIVER_OFFER_QUEUE_ONLINE_PROBE_FAIL path=$path authUid=$authUid '
+        'permissionDenied=$denied error=$e',
+      );
+      debugPrintStack(
+        label: 'DRIVER_OFFER_QUEUE_ONLINE_PROBE_FAIL',
+        stackTrace: st,
+      );
+      if (denied) {
+        debugPrint(
+          'DRIVER_OFFER_LISTENER_PERMISSION_DENIED path=$path uid=$authUid '
+          '(post_online_probe)',
+        );
+      }
+    }
   }
 
   Future<String?> _ensureDriverProfileForDiscovery({
@@ -10225,6 +10281,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       } else {
         _ridePopupOpenPipelineLocked = true;
         try {
+          debugPrint(
+            'DRIVER_OFFER_POPUP_SHOW rideId=${recheckedRide.rideId} '
+            'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'}',
+          );
           await showRideRequestPopup(recheckedRide);
         } finally {
           _ridePopupOpenPipelineLocked = false;
@@ -10248,7 +10308,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       await snapshotProcessingChain;
     }
 
-    if (_rideRequestSubscription != null &&
+    final forceRebindOfferListener =
+        reason == 'goOnline' || reason == 'goOnline_retry';
+    if (!forceRebindOfferListener &&
+        _rideRequestSubscription != null &&
         _driverOfferQueueBoundUid != null &&
         _driverOfferQueueBoundUid == uid) {
       _logRideReq(
@@ -10266,7 +10329,34 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logRtdb(
         'ride request listener refresh city=$driverCity reason=$reason',
       );
+      if (_rideRequestSubscription != null) {
+        _rideDiscoveryListenerHealthy = true;
+        _socketStatus = 'stream_connected';
+      }
+      debugPrint(
+        'DRIVER_OFFER_LISTENER_ATTACHED path=driver_offer_queue/$uid '
+        'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'} '
+        'reason=noop_refresh',
+      );
       return true;
+    }
+
+    debugPrint(
+      'DRIVER_OFFER_LISTENER_ATTACH_START path=driver_offer_queue/${_effectiveDriverId.trim()} '
+      'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'} '
+      'effectiveDriverId=${_effectiveDriverId.trim()} reason=$reason '
+      'forceRebind=$forceRebindOfferListener',
+    );
+    final attachAuth = FirebaseAuth.instance.currentUser?.uid.trim();
+    final attachEffective = _effectiveDriverId.trim();
+    if (attachAuth != null &&
+        attachAuth.isNotEmpty &&
+        attachEffective.isNotEmpty &&
+        attachAuth != attachEffective) {
+      debugPrint(
+        'DRIVER_OFFER_LISTENER_UID_MISMATCH authUid=$attachAuth '
+        'effectiveDriverId=$attachEffective',
+      );
     }
 
     await _cancelRideRequestListener(
@@ -10291,6 +10381,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         return false;
       }
       _driverOfferQueueBoundUid = discoveryUid;
+      final authForQueue = FirebaseAuth.instance.currentUser?.uid.trim();
+      debugPrint(
+        'DRIVER_OFFER_QUEUE_BIND discoveryUid=$discoveryUid '
+        'authUid=${authForQueue ?? 'none'} '
+        'match=${authForQueue != null && authForQueue == discoveryUid}',
+      );
       final driverOfferQueueRef =
           rtdb.FirebaseDatabase.instance.ref('driver_offer_queue/$discoveryUid');
       rtdbFlowLog(
@@ -10346,6 +10442,20 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         _logRideReq(
           '[DRIVER_DISCOVERY_TRACE] driver_offer_queue probe_fail permissionDenied=$denied error=$probeError',
         );
+        if (denied) {
+          debugPrint(
+            'DRIVER_OFFER_LISTENER_PERMISSION_DENIED '
+            'path=driver_offer_queue/$discoveryUid uid=$discoveryUid '
+            'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'} '
+            'phase=pre_listen_probe',
+          );
+        } else {
+          debugPrint(
+            'DRIVER_OFFER_LISTENER_ERROR '
+            'path=driver_offer_queue/$discoveryUid uid=$discoveryUid '
+            'phase=pre_listen_probe error=$probeError',
+          );
+        }
       }
 
       _logRideReq(
@@ -10416,6 +10526,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           if (isRealtimeDatabasePermissionDenied(error)) {
             print('RIDE_DISCOVERY_PERMISSION_DENIED');
             debugPrint(
+              'DRIVER_OFFER_LISTENER_PERMISSION_DENIED '
+              'path=driver_offer_queue/$discoveryUid uid=$discoveryUid '
+              'authUid=$streamUid phase=onValue_stream code=$code message=$message',
+            );
+            debugPrint(
               'RTDB_PERMISSION_ERROR_FULL '
               'error=$error code=$code message=$message '
               'path=driver_offer_queue/$discoveryUid',
@@ -10455,6 +10570,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
             );
             return;
           } else {
+            debugPrint(
+              'DRIVER_OFFER_LISTENER_ERROR path=driver_offer_queue/$discoveryUid '
+              'uid=$discoveryUid authUid=$streamUid phase=onValue_stream '
+              'code=$code message=$message',
+            );
             _showSnackBarSafely(
               SnackBar(
                 content: Text(_discoveryListenerFailureMessage(error)),
@@ -10500,6 +10620,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logDiscoveryChain(
           'online attach success market=$driverCity reason=$reason');
       print('RIDE_DISCOVERY_ATTACH_SUCCESS');
+      debugPrint(
+        'DRIVER_OFFER_LISTENER_ATTACHED path=driver_offer_queue/$discoveryUid '
+        'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'} '
+        'reason=$reason',
+      );
       return true;
     } catch (error) {
       if (isRealtimeDatabasePermissionDenied(error)) {
@@ -10513,6 +10638,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       final message = _firebaseErrorMessage(error);
       _rideRequestsListenerBoundCity = null;
       _rideDiscoveryListenerHealthy = false;
+      _socketStatus = 'disconnected';
       _logReqDebug('listener attach FAIL error=$error');
       _logDriverReq(
         'skippedReason=listener_attach_failed market=$driverCity reason=$reason code=$code message=$message',
@@ -10533,12 +10659,25 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       }
       if (isRealtimeDatabasePermissionDenied(error)) {
         final uid = FirebaseAuth.instance.currentUser?.uid ?? 'none';
+        final bound =
+            (_driverOfferQueueBoundUid ?? _effectiveDriverId.trim()).trim();
+        final path =
+            bound.isEmpty ? 'driver_offer_queue/(none)' : 'driver_offer_queue/$bound';
+        debugPrint(
+          'DRIVER_OFFER_LISTENER_PERMISSION_DENIED path=$path uid=$bound '
+          'authUid=$uid phase=attach_try code=$code message=$message',
+        );
         _logRideReq(
           '[DRIVER_DISCOVERY_TRACE] attach_permission_denied uid=$uid '
           'queryPath=driver_offer_queue/${_driverOfferQueueBoundUid ?? 'none'} code=$code message=$message',
         );
         return false;
       }
+      debugPrint(
+        'DRIVER_OFFER_LISTENER_ERROR path=driver_offer_queue/${_effectiveDriverId.trim()} '
+        'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'} '
+        'phase=attach_try code=$code message=$message error=$error',
+      );
       return false;
     }
   }
