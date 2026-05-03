@@ -58,7 +58,9 @@ function evaluateDriverForOffer(driverProfile, gates, ridePayload) {
     ridePayload.market_pool ?? ridePayload.market ?? "",
   )
     .trim()
-    .toLowerCase();
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/-+/g, "_");
   const dm = String(d.dispatch_market ?? d.market ?? d.market_pool ?? "")
     .trim()
     .toLowerCase()
@@ -108,17 +110,65 @@ async function loadDispatchGates(db) {
   try {
     const snap = await db.ref("app_config/nexride_dispatch").get();
     const g = snap.val() && typeof snap.val() === "object" ? snap.val() : {};
-    return {
+    const gates = {
       soft_verification: boolTrue(g.soft_verification),
       require_bvn: boolTrue(g.require_bvn_verification),
     };
-  } catch (_) {
+    console.log(
+      "DISPATCH_GATES_LOADED",
+      `soft_verification=${gates.soft_verification}`,
+      `require_bvn_verification=${gates.require_bvn}`,
+      `app_config_path=app_config/nexride_dispatch`,
+      `exists=${snap.exists()}`,
+    );
+    return gates;
+  } catch (e) {
+    console.warn(
+      "DISPATCH_GATES_LOAD_FAIL",
+      e && typeof e === "object" && "message" in e ? e.message : e,
+    );
     return { soft_verification: false, require_bvn: false };
   }
+}
+
+/**
+ * Snapshot fields for MATCH_DRIVER_CANDIDATE / debug logs (must match ride_callables fanout filters).
+ * @param {string} driverId
+ * @param {Record<string, unknown>} profile
+ */
+function summarizeDriverForFanout(driverId, profile) {
+  const d = profile && typeof profile === "object" ? profile : {};
+  const online =
+    d.isOnline === true || d.is_online === true || d.online === true;
+  const suspended =
+    boolTrue(d.suspended) ||
+    boolTrue(d.account_suspended) ||
+    String(d.driver_status ?? "")
+      .trim()
+      .toLowerCase() === "suspended";
+  const dm = String(d.dispatch_market ?? d.market_pool ?? d.market ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/-+/g, "_");
+  const status = String(d.status ?? "").trim().toLowerCase();
+  const dispatchState = String(d.dispatch_state ?? "").trim().toLowerCase();
+  const approved =
+    boolTrue(d.nexride_verified) || hasApprovedDocuments(d.verification);
+  return {
+    uid: normUid(driverId),
+    dispatch_market: dm || "missing",
+    online,
+    approved,
+    suspended,
+    status: status || "(empty)",
+    dispatch_state: dispatchState || "(empty)",
+  };
 }
 
 module.exports = {
   normUid,
   evaluateDriverForOffer,
   loadDispatchGates,
+  summarizeDriverForFanout,
 };

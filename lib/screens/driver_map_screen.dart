@@ -9570,9 +9570,11 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (isRealtimeDatabasePermissionDenied(error)) {
       print('RIDE_DISCOVERY_PERMISSION_DENIED');
       debugPrint(
-        'DRIVER_OFFER_LISTENER_PERMISSION_DENIED '
-        'path=driver_offer_queue/$discoveryUid uid=$discoveryUid '
-        'authUid=$streamUid phase=onChildEvent_stream code=$code message=$message',
+        'DRIVER_OFFER_LISTENER_PERMISSION_DENIED path=driver_offer_queue/$discoveryUid uid=$discoveryUid',
+      );
+      debugPrint(
+        'DRIVER_OFFER_LISTENER_PERMISSION_DENIED_DETAIL authUid=$streamUid '
+        'code=$code message=$message',
       );
       debugPrint(
         'RTDB_PERMISSION_ERROR_FULL '
@@ -10472,11 +10474,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return true;
     }
 
+    final attachUid =
+        (FirebaseAuth.instance.currentUser?.uid ?? _effectiveDriverId).trim();
     debugPrint(
-      'DRIVER_OFFER_LISTENER_ATTACH_START path=driver_offer_queue/${_effectiveDriverId.trim()} '
-      'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'} '
-      'effectiveDriverId=${_effectiveDriverId.trim()} reason=$reason '
-      'forceRebind=$forceRebindOfferListener',
+      'DRIVER_OFFER_LISTENER_ATTACH_START path=driver_offer_queue/$attachUid uid=$attachUid',
     );
     final attachAuth = FirebaseAuth.instance.currentUser?.uid.trim();
     final attachEffective = _effectiveDriverId.trim();
@@ -10575,10 +10576,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         );
         if (denied) {
           debugPrint(
-            'DRIVER_OFFER_LISTENER_PERMISSION_DENIED '
-            'path=driver_offer_queue/$discoveryUid uid=$discoveryUid '
-            'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'} '
-            'phase=pre_listen_probe',
+            'DRIVER_OFFER_LISTENER_PERMISSION_DENIED path=driver_offer_queue/$discoveryUid uid=$discoveryUid',
           );
         } else {
           debugPrint(
@@ -10731,11 +10729,17 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         final uid = FirebaseAuth.instance.currentUser?.uid ?? 'none';
         final bound =
             (_driverOfferQueueBoundUid ?? _effectiveDriverId.trim()).trim();
-        final path =
-            bound.isEmpty ? 'driver_offer_queue/(none)' : 'driver_offer_queue/$bound';
+        final denyUid = bound.isEmpty ? uid : bound;
+        final denyPath =
+            denyUid.isEmpty || denyUid == 'none'
+                ? 'driver_offer_queue/(none)'
+                : 'driver_offer_queue/$denyUid';
         debugPrint(
-          'DRIVER_OFFER_LISTENER_PERMISSION_DENIED path=$path uid=$bound '
-          'authUid=$uid phase=attach_try code=$code message=$message',
+          'DRIVER_OFFER_LISTENER_PERMISSION_DENIED path=$denyPath uid=$denyUid',
+        );
+        debugPrint(
+          'DRIVER_OFFER_LISTENER_PERMISSION_DENIED_DETAIL authUid=$uid '
+          'code=$code message=$message phase=attach_try',
         );
         _logRideReq(
           '[DRIVER_DISCOVERY_TRACE] attach_permission_denied uid=$uid '
