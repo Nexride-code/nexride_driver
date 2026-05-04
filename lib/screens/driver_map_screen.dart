@@ -930,6 +930,40 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       );
     }
 
+    final remoteSessionStartedAt =
+        _parseCreatedAt(driverRecord['online_session_started_at']);
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final sessionAgeMs = remoteSessionStartedAt > 0
+        ? nowMs - remoteSessionStartedAt
+        : 1 << 62;
+    const maxRehydrateSessionMs = 7 * 24 * 60 * 60 * 1000;
+    final canRehydrateOnlineSession = remoteOnline &&
+        lastIntentOnline &&
+        remoteSessionStartedAt > 0 &&
+        sessionAgeMs < maxRehydrateSessionMs;
+    if (canRehydrateOnlineSession) {
+      _onlineSessionStartedAt = remoteSessionStartedAt;
+      _lastAvailabilityIntentOnline = lastIntentOnline;
+      _isOnline = true;
+      _rideStatus = 'idle';
+      if (mounted) {
+        setState(() {
+          _isOnline = true;
+          _lastAvailabilityIntentOnline = lastIntentOnline;
+          _rideStatus = 'idle';
+        });
+      }
+      _updateDriverMarker();
+      _startLiveLocationStream();
+      _log(
+        'startup session rehydrated online driverId=$driverId '
+        'online_session_started_at=$_onlineSessionStartedAt '
+        '(skipped RTDB offline wipe — server still shows available session)',
+      );
+      unawaited(_listenForRideRequests(reason: 'startup_rehydrate_online'));
+      return;
+    }
+
     await _clearDriverActiveRideNode(
       reason: remoteOnline
           ? 'startup_restore_force_offline'
@@ -5751,6 +5785,17 @@ class _DriverMapScreenState extends State<DriverMapScreen>
   int _rideExpiryTimestamp(Map<String, dynamic> rideData) =>
       _rideExpiryInfo(rideData).value;
 
+  /// Server [expires_at] plus grace so a just-written queue offer is not dropped.
+  bool _rideExpiredWithOfferGrace(Map<String, dynamic> rideData) {
+    const graceMs = 10000;
+    final expiresAt = _rideExpiryTimestamp(rideData);
+    if (expiresAt <= 0) {
+      return false;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    return now > expiresAt + graceMs;
+  }
+
   int _assignmentExpiryTimestamp(Map<String, dynamic>? rideData) {
     if (rideData == null) {
       return 0;
@@ -6555,27 +6600,31 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       _logPopupServerSkip(rideId, rideData, 'missing_market');
       return 'missing_market';
     }
-    if (driverMarket == null ||
-        driverMarket.isEmpty ||
-        rideMarket != driverMarket) {
-      _logPopupFix('skip reason=market_mismatch rideId=$rideId');
-      _logPopupServerSkip(rideId, rideData, 'market_mismatch');
-      return 'market_mismatch';
+    final fromOfferQueue = rideData['__nexride_from_offer_queue'] == true;
+    if (!fromOfferQueue) {
+      if (driverMarket == null ||
+          driverMarket.isEmpty ||
+          rideMarket != driverMarket) {
+        _logPopupFix('skip reason=market_mismatch rideId=$rideId');
+        _logPopupServerSkip(rideId, rideData, 'market_mismatch');
+        return 'market_mismatch';
+      }
     }
 
     final expiry = _rideExpiryInfo(rideData);
     final expiresAt = expiry.value;
     final nowTimestamp = DateTime.now().millisecondsSinceEpoch;
-    if (expiresAt > 0 && nowTimestamp >= expiresAt) {
+    if (_rideExpiredWithOfferGrace(rideData)) {
       _logPopupFix(
         'skip reason=expired rideId=$rideId now_ms=$nowTimestamp expires_at=$expiresAt '
-        'delta_ms=${nowTimestamp - expiresAt} expiry_field=${expiry.field}',
+        'delta_ms=${expiresAt > 0 ? nowTimestamp - expiresAt : -1} expiry_field=${expiry.field} '
+        'grace_ms=10000',
       );
       _logPopupServerSkip(rideId, rideData, 'expired');
       _logRideReq(
         '[MATCH_DEBUG][DRIVER_FILTER] rideId=$rideId status=$uiStatus '
         'qualifies=false reason=expired now_ms=$nowTimestamp expires_at=$expiresAt '
-        'delta_ms=${nowTimestamp - expiresAt} expiry_field=${expiry.field}',
+        'delta_ms=${expiresAt > 0 ? nowTimestamp - expiresAt : -1} expiry_field=${expiry.field}',
       );
       return 'expired';
     }
@@ -6726,23 +6775,28 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       return 'missing_market';
     }
 
-    if (driverMarket == null ||
-        driverMarket.isEmpty ||
-        rideMarket != driverMarket) {
-      _logPopupServerSkip(rideId, rideData, 'market_mismatch');
-      return 'market_mismatch';
+    final fromOfferQueueStrict = rideData['__nexride_from_offer_queue'] == true;
+    if (!fromOfferQueueStrict) {
+      if (driverMarket == null ||
+          driverMarket.isEmpty ||
+          rideMarket != driverMarket) {
+        _logPopupServerSkip(rideId, rideData, 'market_mismatch');
+        return 'market_mismatch';
+      }
     }
 
-    final expiresAt = _rideExpiryTimestamp(rideData);
-    final nowTimestamp = DateTime.now().millisecondsSinceEpoch;
-    if (expiresAt > 0 && nowTimestamp >= expiresAt) {
+    if (_rideExpiredWithOfferGrace(rideData)) {
       _logPopupServerSkip(rideId, rideData, 'expired');
       return 'expired';
     }
 
+    final expiresAt = _rideExpiryTimestamp(rideData);
+    final nowTimestamp = DateTime.now().millisecondsSinceEpoch;
+
     final createdAt = _parseCreatedAt(rideData['created_at']);
     final requestedAt = _parseCreatedAt(rideData['requested_at']);
-    final hasActiveSearchWindow = expiresAt > 0 && nowTimestamp < expiresAt;
+    final hasActiveSearchWindow =
+        expiresAt > 0 && !_rideExpiredWithOfferGrace(rideData);
     // Server timestamps may still be placeholders in snapshots; a valid future
     // search window proves the request is live for dispatch.
     if (createdAt <= 0 && requestedAt <= 0 && !hasActiveSearchWindow) {
@@ -8415,6 +8469,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     String rideId, {
     bool logSkips = true,
     bool ignoreLocalState = false,
+    Map<String, dynamic>? offerQueueFallbackData,
   }) async {
     if (_isTerminalSelfAcceptedRide(rideId)) {
       _logRideReq(
@@ -8425,17 +8480,34 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
     final snapshot =
         await _rideRequestChildGetIosSafe(rideId, 'load_live_popup_ride');
-    final liveRide = _matchRideForPopup(
-      rideId,
-      snapshot.value,
-      ignoreLocalState: ignoreLocalState,
-      logSkips: false,
-    );
-    if (liveRide != null) {
-      return liveRide;
+    final liveMap = _asStringDynamicMap(snapshot.value);
+    final fb = offerQueueFallbackData;
+    final useOfferFlow =
+        fb != null && fb['__nexride_from_offer_queue'] == true;
+
+    Map<String, dynamic>? mergedPayload = liveMap;
+    if (useOfferFlow) {
+      if (liveMap == null || liveMap.isEmpty) {
+        debugPrint('DRIVER_OFFER_PAYLOAD_USED rideId=$rideId');
+        mergedPayload = Map<String, dynamic>.from(fb);
+      } else {
+        mergedPayload = <String, dynamic>{...fb, ...liveMap}
+          ..['__nexride_from_offer_queue'] = true;
+      }
     }
 
-    final rideData = _asStringDynamicMap(snapshot.value);
+    final matched = _matchRideForPopup(
+      rideId,
+      mergedPayload ?? snapshot.value,
+      ignoreLocalState: ignoreLocalState,
+      logSkips: false,
+      marketDiscoveryCandidate: useOfferFlow,
+    );
+    if (matched != null) {
+      return matched;
+    }
+
+    final rideData = mergedPayload ?? _asStringDynamicMap(snapshot.value);
     final skipReason =
         _popupServerSkipReason(rideId, rideData) ?? 'unavailable';
     _logInvalidRideBlocked(rideId: rideId, reason: skipReason);
@@ -8709,8 +8781,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         return;
       }
       cityToSave = repairedMarket;
-      // Backend fanout (ride_callables.js) queries drivers by `dispatch_market` — must align with ride market.
-      cityToSave = DriverServiceAreaConfig.marketForCity('lagos').city;
+      // Fanout indexes drivers by `dispatch_market`; must match the rider ride `market` (never force a single city).
       _driverCity = cityToSave;
       _selectedLaunchCity = cityToSave;
       if (_deviceLocationOutsideLaunchArea) {
@@ -9506,9 +9577,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     if (pickupMap == null) {
       return null;
     }
+    final riderId = _valueAsText(offer['rider_id']);
+    final pickupAddr = _valueAsText(offer['pickup_address']);
+    final dropAddr = _valueAsText(offer['dropoff_address']);
     return <String, dynamic>{
       RtdbRideRequestFields.rideId: rideId,
-      RtdbRideRequestFields.riderId: '',
+      RtdbRideRequestFields.riderId: riderId,
       RtdbRideRequestFields.driverId: null,
       RtdbRideRequestFields.marketPool: pool,
       RtdbRideRequestFields.market: pool,
@@ -9516,12 +9590,18 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       RtdbRideRequestFields.tripState: TripLifecycleState.searching,
       RtdbRideRequestFields.pickup: pickupMap,
       RtdbRideRequestFields.dropoff: offer['dropoff'],
+      'pickup_address': pickupAddr.isEmpty ? null : pickupAddr,
+      'dropoff_address': dropAddr.isEmpty ? null : dropAddr,
+      'destination_address': dropAddr.isEmpty ? null : dropAddr,
       RtdbRideRequestFields.fare: offer['fare'],
+      'distance_km': offer['distance_km'],
+      'eta_minutes': offer['eta_minutes'],
       'service_type': offer['service_type'],
       RtdbRideRequestFields.paymentMethod: offer['payment_method'],
       RtdbRideRequestFields.paymentStatus: offer['payment_status'],
       RtdbRideRequestFields.expiresAt: offer['expires_at'],
       RtdbRideRequestFields.createdAt: offer['created_at'],
+      '__nexride_from_offer_queue': true,
     };
   }
 
@@ -9639,6 +9719,66 @@ class _DriverMapScreenState extends State<DriverMapScreen>
         '[DRIVER_DISCOVERY_TRACE] snackbar_state=set_stream_error source=listener_non_permission',
       );
     }
+  }
+
+  /// Backend fanout keys off RTDB `drivers/{uid}` (isOnline / dispatch_market).
+  /// When the map thinks we are in an online session but RTDB is stale, republish
+  /// so `createRideRequest` can write [driver_offer_queue]. Honors explicit offline intent.
+  Future<bool> _ensureDiscoveryPresenceMatchesServer({
+    required rtdb.DatabaseReference driverRef,
+    required String driverCity,
+    required Map<String, dynamic>? snapMap,
+  }) async {
+    if (!_isOnline || _onlineSessionStartedAt <= 0 || snapMap == null) {
+      return true;
+    }
+    final intent =
+        _valueAsText(snapMap['last_availability_intent']).toLowerCase();
+    final remoteOn = _asBool(snapMap['isOnline']) ||
+        _asBool(snapMap['online']) ||
+        _asBool(snapMap['is_online']);
+    if (intent == 'offline' && !remoteOn) {
+      _logRideReq(
+        '[DISCOVERY] RTDB offline intent with no presence — clearing stale local online',
+      );
+      _isOnline = false;
+      _onlineSessionStartedAt = 0;
+      _lastAvailabilityIntentOnline = false;
+      if (mounted) {
+        _setStateSafely(() {});
+      }
+      return false;
+    }
+    if (!remoteOn && intent != 'offline') {
+      _logRideReq(
+        '[DISCOVERY_PRESENCE_RESYNC] local online session but RTDB shows offline '
+        '— publishing presence market=$driverCity',
+      );
+      try {
+        await driverRef.update(<String, Object?>{
+          'online_session_started_at': _onlineSessionStartedAt,
+          'isOnline': true,
+          'is_online': true,
+          'online': true,
+          'isAvailable': true,
+          'available': true,
+          'status': 'available',
+          'dispatch_state': 'available',
+          'dispatch_market': driverCity,
+          'market': driverCity,
+          'market_pool': driverCity,
+          'city': driverCity,
+          'last_availability_intent': 'online',
+          'last_availability_intent_at': rtdb.ServerValue.timestamp,
+          'last_active_at': rtdb.ServerValue.timestamp,
+          'updated_at': rtdb.ServerValue.timestamp,
+        });
+        _lastAvailabilityIntentOnline = true;
+      } catch (error) {
+        _logRideReq('[DISCOVERY_PRESENCE_RESYNC] update failed error=$error');
+      }
+    }
+    return true;
   }
 
   Future<bool> _listenForRideRequests({required String reason}) async {
@@ -9876,6 +10016,20 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     }
 
     driverCity = DriverServiceAreaConfig.marketForCity(driverCity).city;
+    final presenceOk = await _ensureDiscoveryPresenceMatchesServer(
+      driverRef: driverRef,
+      driverCity: driverCity,
+      snapMap: snapMap,
+    );
+    if (!presenceOk) {
+      _logRideReq(
+        'request listener SKIPPED reason=rtdb_offline_intent driverCity=$driverCity',
+      );
+      _showAvailabilityFailureNotice(
+        'You are offline on the server. Tap GO ONLINE to receive ride requests.',
+      );
+      return false;
+    }
     _logReqDebug('listener attach START market=$driverCity');
     _logRideReq(
       'driver online state for discovery online=$_isOnline session=$_onlineSessionStartedAt market=$driverCity',
@@ -10059,12 +10213,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           'ride eval rideId=$rideId status=$status qualifies=$qualifies reason=${skipReason.isEmpty ? 'qualified' : skipReason}',
         );
         if (qualifies) {
-          final qUid = FirebaseAuth.instance.currentUser?.uid.trim() ?? '';
-          if (_loggedDriverOfferReceivedRideIds.add(rideId)) {
-            debugPrint(
-              'DRIVER_OFFER_RECEIVED rideId=$rideId path=driver_offer_queue/$qUid/$rideId',
-            );
-          }
+          _loggedDriverOfferReceivedRideIds.add(rideId);
           activeOpenRideMap[rideId] = rideData;
         }
       }
@@ -10412,10 +10561,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       } else {
         _ridePopupOpenPipelineLocked = true;
         try {
-          debugPrint(
-            'DRIVER_OFFER_POPUP_SHOW rideId=${recheckedRide.rideId} '
-            'authUid=${FirebaseAuth.instance.currentUser?.uid ?? 'none'}',
-          );
+          debugPrint('DRIVER_OFFER_POPUP_SHOW rideId=${recheckedRide.rideId}');
           await showRideRequestPopup(recheckedRide);
         } finally {
           _ridePopupOpenPipelineLocked = false;
@@ -10626,6 +10772,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
           if (key == null || key.isEmpty) {
             return;
           }
+          debugPrint('DRIVER_OFFER_RECEIVED_FROM_QUEUE rideId=$key');
           _driverOfferQueueReplica[key] = event.snapshot.value;
           try {
             await queueRideMapProcessing(
@@ -10867,6 +11014,10 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     _MatchedRideRequest ride, {
     bool rideAlreadyReserved = false,
   }) async {
+    final Map<String, dynamic>? offerQueueFallback =
+        ride.rideData['__nexride_from_offer_queue'] == true
+            ? ride.rideData
+            : null;
     _logRideReq(
       'showRideRequestPopup enter rideId=${ride.rideId} reserved=$rideAlreadyReserved '
       'online=$_isOnline popupOpen=$_popupOpen hasActive=$_hasActivePopup',
@@ -10949,8 +11100,12 @@ class _DriverMapScreenState extends State<DriverMapScreen>
     StateSetter? dialogSetState;
 
     try {
-      var popupRide =
-          rideAlreadyReserved ? ride : await _loadLivePopupRide(ride.rideId);
+      var popupRide = rideAlreadyReserved
+          ? ride
+          : await _loadLivePopupRide(
+              ride.rideId,
+              offerQueueFallbackData: offerQueueFallback,
+            );
       if (popupRide == null) {
         _logRidePopup('skip rideId=${ride.rideId} reason=live_load_null');
         _logRideReq(
@@ -11104,6 +11259,7 @@ class _DriverMapScreenState extends State<DriverMapScreen>
       final refreshedPopupRide = await _loadLivePopupRide(
         popupRide.rideId,
         logSkips: false,
+        offerQueueFallbackData: offerQueueFallback,
       );
       if (refreshedPopupRide == null) {
         _logRideReq(
